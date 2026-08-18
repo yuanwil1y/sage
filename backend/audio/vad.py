@@ -109,7 +109,11 @@ class UtteranceSegmenter:
     def finish(self) -> list[np.ndarray]:
         """Flush a partial stream, including a final sub-512-sample speech tail."""
         utterances: list[np.ndarray] = []
-        if self._remainder.size and self._in_speech:
+        # A sub-frame tail cannot be classified by Silero. Preserve it only when
+        # the last classified VAD frame was speech. If we are already inside a
+        # trailing-silence run, treating unknown tail samples as speech would
+        # re-introduce silence that _emit() is intentionally trimming.
+        if self._remainder.size and self._in_speech and self._silence_frames == 0:
             self._buf.append(self._remainder.copy())
         self._remainder = np.zeros(0, dtype=np.float32)
 
