@@ -106,7 +106,6 @@ class TranslatorOrchestrator:
         """Atomically use ``translator`` for subsequent queued messages."""
         with self._translator_lock:
             self.translator = translator
-        self._report_status("Translation", "Translator: ready")
 
     def configure_voice_settings(self, *, vad_threshold: float, min_silence_ms: int) -> None:
         """Apply voice settings to the current audio pipeline."""
@@ -239,20 +238,31 @@ class TranslatorOrchestrator:
                 self._translation_queue.task_done()
 
     def _stop_workers(self, timeout: float = 5.0) -> None:
+        """Stop ASR first so its final results reach translation before its stop."""
         with self._worker_lock:
             self._stopping = True
             asr_thread = self._asr_thread
             translation_thread = self._translation_thread
             if self._utterance_queue is not None and asr_thread is not None:
                 self._put_stop(self._utterance_queue)
-            if translation_thread is not None:
-                self._put_stop(self._translation_queue)
 
-        for thread in (asr_thread, translation_thread):
-            if thread is not None and thread is not threading.current_thread():
-                thread.join(timeout=timeout)
-                if thread.is_alive():
-                    log.warning("worker %s 未在 %.1fs 内退出", thread.name, timeout)
+        if asr_thread is not None and asr_thread is not threading.current_thread():
+            asr_thread.join(timeout=timeout)
+            if asr_thread.is_alive():
+                log.warning("worker %s 未在 %.1fs 内退出", asr_thread.name, timeout)
+
+        # Only after ASR has had the chance to enqueue its last SourceMessage do
+        # we place the translation stop sentinel at the end of that queue.
+        if translation_thread is not None:
+            self._put_stop(self._translation_queue)
+            if translation_thread is not threading.current_thread():
+                translation_thread.join(timeout=timeout)
+                if translation_thread.is_alive():
+                    log.warning(
+                        "worker %s 未在 %.1fs 内退出",
+                        translation_thread.name,
+                        timeout,
+                    )
 
     # ---- 语音主链 ----
 
@@ -283,7 +293,13 @@ class TranslatorOrchestrator:
             return
         if not text:
             return
-        self._enqueue_source(SourceMessage(source_type="voice", original=text))
+        # This call originates inside the already-running ASR worker. During a
+        # graceful shutdown external producers are stopped, but in-flight ASR
+        # output must still be allowed to drain into translation.
+        self._enqueue_source(
+            SourceMessage(source_type="voice", original=text),
+            ensure_workers=False,
+        )
 
     def handle_pcm(self, pcm_bytes: bytes) -> None:
         """PCM hot path: normalize/resample/VAD only; completed speech is queued."""
@@ -306,10 +322,18 @@ class TranslatorOrchestrator:
             return
         if not self._ensure_workers_started():
             return
-        self._enqueue_source(SourceMessage(source_type="chat", original=original.strip()))
+        self._enqueue_source(
+            SourceMessage(source_type="chat", original=original.strip()),
+            ensure_workers=False,
+        )
 
-    def _enqueue_source(self, source: SourceMessage) -> None:
-        if not self._ensure_workers_started():
+    def _enqueue_source(
+        self,
+        source: SourceMessage,
+        *,
+        ensure_workers: bool = True,
+    ) -> None:
+        if ensure_workers and not self._ensure_workers_started():
             return
         self._put_latest(self._translation_queue, source, "翻译")
 
@@ -322,7 +346,7 @@ class TranslatorOrchestrator:
                 translator = self.translator
             translated = translator.translate(source.original)
         except Exception as exc:
-            self._report_status("Translation", f"Translator error: {exc}")
+            self._report_status("Local Translation", f"Translator error: {exc}")
             log.exception("翻译失败: %s", source.original)
             return False
 
@@ -336,7 +360,7 @@ class TranslatorOrchestrator:
         try:
             self.pipe.broadcast(protocol.subtitle_message(result))
         except Exception as exc:
-            self._report_status("Translation", f"IPC error: {exc}")
+            self._report_status("Game Bar", f"IPC error: {exc}")
             log.exception("字幕广播失败")
             return False
         log.info("[%s] %s → %s", source.source_type, source.original, translated)
