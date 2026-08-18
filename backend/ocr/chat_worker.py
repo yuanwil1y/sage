@@ -1,8 +1,8 @@
 """Real-time screen/OCR worker for the VALORANT chat region.
 
-The worker intentionally has no game-specific knowledge.  It samples one
+The worker intentionally has no game-specific knowledge. It samples one
 configured DXcam region, skips unchanged frames, OCRs the newest changed
-frame, assembles visual fragments into lines, and emits only new lines.  The
+frame, assembles visual fragments into lines, and emits only new lines. The
 translation and IPC layers remain owned by ``TranslatorOrchestrator``.
 """
 
@@ -92,8 +92,6 @@ class FrameChangeDetector:
                 interpolation=cv2.INTER_AREA,
             ).astype(np.float32, copy=False)
         except ImportError:
-            # Keep the detector useful in lightweight unit-test environments;
-            # the production OCR path still requires OpenCV.
             y_idx = np.linspace(0, gray.shape[0] - 1, height).astype(int)
             x_idx = np.linspace(0, gray.shape[1] - 1, width).astype(int)
             return gray[np.ix_(y_idx, x_idx)].astype(np.float32, copy=False)
@@ -126,7 +124,7 @@ class ChatOcrWorker:
         self.min_score = min_score
         self.capture: FrameCapture = capture or ScreenCapture(region.output_idx)
         self.recognizer: FrameRecognizer = recognizer or OcrEngine(lang="japan")
-        self.deduper = deduper or OcrDeduper(threshold=90.0, ttl=30.0)
+        self.deduper = deduper or OcrDeduper(threshold=90.0)
         self.change_detector = FrameChangeDetector(threshold=change_threshold)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -140,6 +138,7 @@ class ChatOcrWorker:
             return
         self._stop_event.clear()
         self.change_detector.reset()
+        self.deduper.reset()
         self._thread = threading.Thread(
             target=self._run,
             name="ChatOcrWorker",
@@ -155,7 +154,6 @@ class ChatOcrWorker:
         change_threshold: float | None = None,
     ) -> None:
         """Apply OCR tuning values to a running or future worker."""
-
         if poll_hz is not None:
             if float(poll_hz) <= 0:
                 raise ValueError("poll_hz must be positive")
@@ -179,8 +177,7 @@ class ChatOcrWorker:
             log.exception("释放 DXcam 失败")
 
     def process_frame(self, frame: np.ndarray) -> list[str]:
-        """OCR one frame and return the lines emitted to ``on_line``."""
-
+        """OCR one frame and return the newly appended visible chat lines."""
         texts, scores, boxes = self.recognizer.recognize(frame)
         fragments: list[OcrFragment] = []
         for index, text in enumerate(texts):
@@ -195,24 +192,22 @@ class ChatOcrWorker:
                 continue
             fragments.append(OcrFragment(text=text, box=box, score=score))
 
+        visible_lines = [line.strip() for line in assemble_line(fragments) if line.strip()]
+        new_lines = self.deduper.filter_new(visible_lines)
+
         emitted: list[str] = []
-        for line in assemble_line(fragments):
-            line = line.strip()
-            if not line or self.deduper.is_duplicate(line):
-                continue
+        for line in new_lines:
             try:
                 self.on_line(line)
             except Exception:
                 log.exception("聊天行回调失败: %s", line)
                 continue
-            self.deduper.mark_seen(line)
             emitted.append(line)
         if emitted:
             self._report_status(f"OCR: {len(emitted)} new line(s)")
         return emitted
 
     def _run(self) -> None:
-        interval = 1.0 / self.poll_hz
         final_status = "OCR: stopped"
         self._report_status("OCR: running")
         try:
@@ -230,6 +225,8 @@ class ChatOcrWorker:
                     log.exception("聊天 OCR 轮询失败")
                     self._report_status(f"OCR: error ({exc})")
                 elapsed = time.monotonic() - started
+                # poll_hz may be changed from the UI while this worker is live.
+                interval = 1.0 / self.poll_hz
                 self._stop_event.wait(max(0.0, interval - elapsed))
         finally:
             try:
