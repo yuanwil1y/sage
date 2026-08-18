@@ -2,7 +2,7 @@
 ; Sage now ships as one complete offline application payload.
 
 #define MyAppName "Sage"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.14"
 #define MyAppPublisher "Williamyuan132"
 #define MyAppId "{{A2C7F0E4-1D18-4C4A-9BB5-4B8FE4E74A1D}"
 
@@ -15,8 +15,8 @@ AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-AppPublisherURL=https://github.com/Williamyuan132/valorant-translator
-AppSupportURL=https://github.com/Williamyuan132/valorant-translator/issues
+AppPublisherURL=https://github.com/yuanwil1y/sage
+AppSupportURL=https://github.com/yuanwil1y/sage/issues
 DefaultDirName={localappdata}\Programs\ValorantTranslator
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -70,6 +70,7 @@ Filename: "{cmd}"; Parameters: "/C taskkill /F /T /IM SageWidgetService.exe"; Fl
 ; 先由应用自身卸载 Game Bar 小组件并删除与安装包精确匹配的证书。
 Filename: "{app}\ValorantTranslator.exe"; Parameters: "--cleanup-gamebar"; Flags: runhidden waituntilterminated; RunOnceId: "CleanupValorantTranslatorGameBar"
 ; 即使应用清理入口损坏，也按参考项目的方式删除回环豁免后再移除小组件。
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "/C taskkill /F /T /IM SageWidgetService.exe"; Flags: runhidden waituntilterminated; RunOnceId: "TerminateSageWidgetServiceFallback"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""$p = Get-AppxPackage -Name 'ValorantTranslator' -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1; if ($p) {{ $e = Start-Process -FilePath 'CheckNetIsolation.exe' -ArgumentList @('LoopbackExempt','-d',('-n=' + $p.PackageFamilyName)) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; $p | Remove-AppxPackage -ErrorAction SilentlyContinue }"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveValorantTranslatorWidget"
 
 [Code]
