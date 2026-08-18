@@ -5,6 +5,7 @@
 - 200~500ms 停顿不切句
 - speech_pad 前后保留
 - 超过 20s 强制切分
+- 任意输入 chunk 边界不丢失 512-sample VAD remainder
 """
 
 import numpy as np
@@ -50,18 +51,15 @@ def test_silence_800ms_ends_utterance() -> None:
         min_silence_duration_ms=800,
         speech_pad_ms=0,
     )
-    speech_frames = 10  # 320ms 语音
-    silence_frames = round(800 / FRAME_MS)  # 25 帧静音
+    speech_frames = 10
+    silence_frames = round(800 / FRAME_MS)
     utterances = _feed(seg, _probs(speech_frames, silence_frames))
 
     assert len(utterances) == 1
-    # 句长 = 语音帧 + 静音帧 - pad(0)；emit 时 silence_frames(25) > pad(0)
-    # 截掉全部尾部静音 → 恰好 10 帧
     assert utterances[0].shape[0] == speech_frames * FRAME_SIZE
 
 
 def test_short_pause_does_not_split() -> None:
-    """语音中间 384ms（12 帧）停顿 < 800ms：应保持整句。"""
     seg = UtteranceSegmenter(
         model=ScriptedModel([]),
         threshold=0.5,
@@ -71,30 +69,27 @@ def test_short_pause_does_not_split() -> None:
     probs = [0.9] * 5 + [0.1] * 12 + [0.9] * 5 + [0.1] * 25
     utterances = _feed(seg, probs)
     assert len(utterances) == 1
-    assert utterances[0].shape[0] == (5 + 12 + 5) * FRAME_SIZE  # 尾部 25 帧静音被截掉
+    assert utterances[0].shape[0] == (5 + 12 + 5) * FRAME_SIZE
 
 
 def test_speech_pad_keeps_context() -> None:
-    """speech_pad=300ms：句首/句尾各保留约 300ms。"""
-    pad_frames = round(300 / FRAME_MS)  # ≈ 9
+    pad_frames = round(300 / FRAME_MS)
     seg = UtteranceSegmenter(
         model=ScriptedModel([]),
         threshold=0.5,
         min_silence_duration_ms=800,
         speech_pad_ms=300,
     )
-    lead_silence = 4  # 语音前有 4 帧静音（< pad_frames）
+    lead_silence = 4
     probs = [0.1] * lead_silence + _probs(10, 25)
     utterances = _feed(seg, probs)
 
     assert len(utterances) == 1
-    # 句首：pre-roll 全部 4 帧 + 语音 10 帧 + 句尾 pad 9 帧
     expected = (lead_silence + 10 + pad_frames) * FRAME_SIZE
     assert utterances[0].shape[0] == expected
 
 
 def test_max_utterance_force_split() -> None:
-    """max_utterance_ms=320（10 帧）：超长语音被强制切分。"""
     seg = UtteranceSegmenter(
         model=ScriptedModel([]),
         threshold=0.5,
@@ -102,8 +97,7 @@ def test_max_utterance_force_split() -> None:
         speech_pad_ms=0,
         max_utterance_ms=320,
     )
-    utterances = _feed(seg, _probs(25, 0))  # 25 帧连续语音
-    # 第 10 帧时触发强制切分，第 20 帧再次触发 → 3 段
+    utterances = _feed(seg, _probs(25, 0))
     assert len(utterances) >= 2
     for u in utterances:
         assert u.shape[0] == 10 * FRAME_SIZE
@@ -116,8 +110,53 @@ def test_finish_emits_partial_speech() -> None:
         min_silence_duration_ms=800,
         speech_pad_ms=0,
     )
-    _feed(seg, [0.9] * 30)  # 连续语音，未静音结尾
+    _feed(seg, [0.9] * 30)
     partial = seg.finish()
     assert len(partial) == 1
     assert partial[0].shape[0] == 30 * FRAME_SIZE
     assert not seg.in_speech
+
+
+def test_random_chunk_boundaries_match_one_shot_segmentation() -> None:
+    probs = [0.9] * 8 + [0.1] * 25 + [0.9] * 6 + [0.1] * 25
+    audio = _frames(len(probs))
+
+    one_shot = UtteranceSegmenter(
+        model=ScriptedModel(probs.copy()),
+        min_silence_duration_ms=800,
+        speech_pad_ms=0,
+    )
+    expected = one_shot.process(audio) + one_shot.finish()
+
+    chunked = UtteranceSegmenter(
+        model=ScriptedModel(probs.copy()),
+        min_silence_duration_ms=800,
+        speech_pad_ms=0,
+    )
+    rng = np.random.default_rng(20260819)
+    actual: list[np.ndarray] = []
+    offset = 0
+    while offset < audio.size:
+        size = int(rng.integers(1, 1300))
+        actual.extend(chunked.process(audio[offset : offset + size]))
+        offset += size
+    actual.extend(chunked.finish())
+
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        np.testing.assert_array_equal(got, want)
+
+
+def test_finish_keeps_subframe_tail_when_speech_is_active() -> None:
+    probs = [0.9]
+    seg = UtteranceSegmenter(
+        model=ScriptedModel(probs),
+        speech_pad_ms=0,
+    )
+    audio = np.ones(FRAME_SIZE + 123, dtype=np.float32)
+
+    assert seg.process(audio) == []
+    partial = seg.finish()
+
+    assert len(partial) == 1
+    assert partial[0].shape[0] == FRAME_SIZE + 123
