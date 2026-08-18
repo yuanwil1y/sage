@@ -12,6 +12,7 @@ from model_store import get_model_spec, model_file_path, model_status
 log = logging.getLogger("runtime.models")
 
 _TRACKED_MODELS = ("hy-mt2", "whisper-medium")
+_STABLE_UNAVAILABLE_STATES = {"missing", "incomplete", "invalid"}
 
 
 class PassthroughTranslator:
@@ -128,7 +129,12 @@ class RuntimeModelController:
                 # Covers first install and atomic replacement while status stays
                 # installed but file size/mtime fingerprint changes.
                 self.handle_change(model_key, "下载")
-            elif old_status == "installed" and new_status != "installed":
+            elif (
+                old_status == "installed"
+                and new_status in _STABLE_UNAVAILABLE_STATES
+            ):
+                # Do not degrade on transient "changing" / "error" reads while
+                # files are being atomically replaced; wait for a stable state.
                 self.handle_change(model_key, "删除")
 
     def _watch_loop(self) -> None:
