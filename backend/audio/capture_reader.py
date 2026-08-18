@@ -242,11 +242,16 @@ class AudioCaptureReader:
             if self._stop_event.wait(delay):
                 break
 
-            if self.on_before_restart is not None:
-                try:
+            try:
+                if self.on_before_restart is not None:
                     self.on_before_restart(target_pid, failure_count)
-                except Exception:
-                    log.exception("audio-capture restart 回调失败")
+                elif self.on_pcm is not None:
+                    # Internal stream-boundary marker. AudioPipeline.feed_pcm
+                    # treats b"" as reset-without-emitting, so DSP/VAD state
+                    # never leaks across two helper processes.
+                    self.on_pcm(b"")
+            except Exception:
+                log.exception("audio-capture restart/stream-reset 回调失败")
 
         with self._proc_lock:
             if self._proc is not None and self._proc.poll() is not None:
