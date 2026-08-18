@@ -1,16 +1,8 @@
-"""Build and assemble the single Full PyInstaller distribution.
+"""Build and assemble the Sage Full PyInstaller distribution.
 
-This script intentionally stops at runnable directories. Inno Setup is a
-separate later step so the runnable directory can be verified before the
-installer is compiled.
-
-Usage (from ``backend``)::
-
-    python build_package.py
-
-Each command produces one canonical executable at::
-
-    dist/variants/full/ValorantTranslator/ValorantTranslator.exe
+Production builds are intentionally strict: every external runtime payload,
+including a signed x64 Game Bar package, must be present. ``--allow-missing``
+is reserved for local dependency/packaging experiments.
 """
 
 from __future__ import annotations
@@ -20,7 +12,10 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
+
+from release_validation import validate_release_metadata
 
 BACKEND = Path(__file__).resolve().parent
 REPO = BACKEND.parent
@@ -29,7 +24,6 @@ BUILD_ROOT = BACKEND / "build" / "variants" / "full"
 PACKAGE_DIR = DIST_ROOT / "ValorantTranslator"
 SPEC = BACKEND / "ValorantTranslator.spec"
 
-# 源资源位置
 SRC_NATIVE = REPO / "native" / "audio-capture" / "build" / "Release" / "valorant_audio_capture.exe"
 SRC_RESOURCES = BACKEND / "resources" / "valorant_ja_zh.json"
 SRC_ICON = BACKEND / "resources" / "Sage.ico"
@@ -40,7 +34,7 @@ SRC_GAMEBAR = REPO / "gamebar-widget" / "AppPackages"
 
 def copy(src: Path, dst: Path, desc: str) -> bool:
     if not src.exists():
-        print(f"[跳过] {desc} 源不存在: {src}")
+        print(f"[缺失] {desc} 源不存在: {src}")
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and dst.stat().st_size == src.stat().st_size:
@@ -53,9 +47,8 @@ def copy(src: Path, dst: Path, desc: str) -> bool:
 
 
 def copy_dir(src_dir: Path, dst_dir: Path, desc: str) -> bool:
-    """复制一个只含运行时文件的目录。"""
     if not src_dir.exists():
-        print(f"[跳过] {desc} 源不存在: {src_dir}")
+        print(f"[缺失] {desc} 源不存在: {src_dir}")
         return False
     dst_dir.mkdir(parents=True, exist_ok=True)
     print(f"[复制目录] {desc}: {src_dir} -> {dst_dir}")
@@ -67,62 +60,62 @@ def copy_dir(src_dir: Path, dst_dir: Path, desc: str) -> bool:
     return True
 
 
-def copy_gamebar_widget(src_dir: Path, dst_dir: Path) -> bool:
-    """Stage only the x64 Game Bar release payload and its runtime dependencies.
-
-    Visual Studio's AppPackages folder also contains ARM/x86 packages, symbols,
-    developer install scripts, and telemetry helpers.  None of those are used
-    by Sage's x64 GUI installer, so keeping them would only inflate the release.
-    """
-
-    if not src_dir.exists():
+def package_has_embedded_signature(path: Path) -> bool:
+    """MSIX/APPX signing adds AppxSignature.p7x to the ZIP container."""
+    try:
+        with zipfile.ZipFile(path) as package:
+            names = {name.lower() for name in package.namelist()}
+    except (OSError, zipfile.BadZipFile):
         return False
-    payloads = sorted(
-        [
+    return "appxsignature.p7x" in names
+
+
+def _package_version(path: Path) -> tuple[int, int, int, int]:
+    match = re.search(r"_(\d+\.\d+\.\d+\.\d+)_", path.parent.name)
+    if not match:
+        return (0, 0, 0, 0)
+    return tuple(int(part) for part in match.group(1).split("."))  # type: ignore[return-value]
+
+
+def copy_gamebar_widget(src_dir: Path, dst_dir: Path) -> bool:
+    """Stage the newest signed x64 Game Bar payload plus cert/dependencies."""
+    if not src_dir.exists():
+        print(f"[缺失] Game Bar AppPackages 目录不存在: {src_dir}")
+        return False
+
+    candidates = [
         path
         for path in src_dir.rglob("*")
         if path.is_file()
         and path.suffix.lower() in {".msix", ".appx"}
+        and "x64" in path.name.lower()
         and any(
             product_name in path.name.lower()
             for product_name in ("sagegamebar.package", "valoranttranslator")
         )
-        and "x64" in path.name.lower()
-        ],
+    ]
+    signed = [path for path in candidates if package_has_embedded_signature(path)]
+    if not signed:
+        if candidates:
+            print("[缺失] 找到了 x64 Game Bar 包，但没有包包含 AppxSignature.p7x")
+        else:
+            print("[缺失] 未找到 x64 Game Bar MSIX/APPX")
+        return False
+
+    payload = max(
+        signed,
         key=lambda path: (
-            0 if path.suffix.lower() == ".msix" else 1,
-            tuple(
-                int(part)
-                for part in re.search(
-                    r"_(\d+\.\d+\.\d+\.\d+)_",
-                    path.parent.name,
-                ).group(1).split(".")
-            )
-            if re.search(r"_(\d+\.\d+\.\d+\.\d+)_", path.parent.name)
-            else (0, 0, 0, 0),
+            path.suffix.lower() == ".msix",
+            _package_version(path),
             str(path).lower(),
         ),
     )
-    if not payloads:
-        print("[跳过] Game Bar 小组件：未找到 x64 MSIX/APPX，GUI 将提供初始化提示")
-        return False
-    # Prefer MSIX and, among packages with the same extension, the highest
-    # manifest version. This prevents an older package left in AppPackages
-    # from silently being staged after a widget update.
-    payload = payloads[0]
-    for candidate in payloads[1:]:
-        current_version = re.search(r"_(\d+\.\d+\.\d+\.\d+)_", payload.parent.name)
-        candidate_version = re.search(r"_(\d+\.\d+\.\d+\.\d+)_", candidate.parent.name)
-        current_key = tuple(int(part) for part in current_version.group(1).split(".")) if current_version else (0, 0, 0, 0)
-        candidate_key = tuple(int(part) for part in candidate_version.group(1).split(".")) if candidate_version else (0, 0, 0, 0)
-        if (candidate.suffix.lower() == ".msix", candidate_key, str(candidate).lower()) > (
-            payload.suffix.lower() == ".msix",
-            current_key,
-            str(payload).lower(),
-        ):
-            payload = candidate
     package_dir = payload.parent
     certificates = sorted(package_dir.glob("*.cer"), key=lambda path: str(path).lower())
+    if not certificates:
+        print(f"[缺失] signed Game Bar 包没有配套 .cer: {package_dir}")
+        return False
+
     dependency_dir = package_dir / "Dependencies" / "x64"
     dependencies = (
         sorted(
@@ -150,18 +143,16 @@ def copy_gamebar_widget(src_dir: Path, dst_dir: Path) -> bool:
         for dependency in dependencies:
             shutil.copy2(dependency, staged_dependencies / dependency.name)
 
-    print(f"[复制目录] Game Bar x64 小组件: {package_dir} -> {staged_package}")
+    print(f"[复制目录] signed Game Bar x64 小组件: {package_dir} -> {staged_package}")
     print(
-        "        完成（1 个 MSIX/APPX、"
+        "        完成（1 个 signed MSIX/APPX、"
         f"{len(certificates)} 个证书、{len(dependencies)} 个 x64 依赖）"
     )
     return True
 
 
 def run_pyinstaller() -> Path:
-    """Build the Full spec and return its package directory."""
     destination = PACKAGE_DIR
-    # These are generated build outputs, never the user model/config directory.
     if destination.exists():
         shutil.rmtree(destination)
     DIST_ROOT.mkdir(parents=True, exist_ok=True)
@@ -190,7 +181,6 @@ def run_pyinstaller() -> Path:
 
 
 def assemble(destination: Path, allow_missing: bool) -> None:
-    """Copy the external resources required by the Full edition."""
     print("=== 布置 Full 版本外部资源 ===")
     missing: list[str] = []
 
@@ -198,8 +188,6 @@ def assemble(destination: Path, allow_missing: bool) -> None:
         if not ok:
             missing.append(label)
 
-    # Full uses the local llama.cpp server for Hy-MT2 translation. The
-    # GGUF itself stays in the post-install model directory.
     require_copy(
         copy_dir(
             REPO / "runtime" / "llama.cpp",
@@ -216,11 +204,10 @@ def assemble(destination: Path, allow_missing: bool) -> None:
         copy(SRC_ICON, destination / "resources" / "Sage.ico", "Sage 应用图标"),
         "backend/resources/Sage.ico",
     )
-
-    # Full can display subtitles in the Game Bar widget. This
-    # remains optional because the repository does not commit a signed MSIX.
-    copy_gamebar_widget(SRC_GAMEBAR, destination / "gamebar-widget")
-
+    require_copy(
+        copy_gamebar_widget(SRC_GAMEBAR, destination / "gamebar-widget"),
+        "signed x64 Game Bar package + certificate",
+    )
     require_copy(
         copy(
             SRC_NATIVE,
@@ -249,16 +236,21 @@ def assemble(destination: Path, allow_missing: bool) -> None:
 
     if missing and not allow_missing:
         raise SystemExit(
-            "[错误] 缺少 "
-            f"Full 版本所需资源: {', '.join(missing)}；"
-            "如只需验证 PyInstaller 依赖，请使用 --allow-missing"
+            "[错误] Full 生产包缺少必需资源: "
+            f"{', '.join(missing)}；"
+            "如只需验证 PyInstaller 依赖，请显式使用 --allow-missing"
         )
     if missing:
-        print(f"[警告] Full 版本是不完整开发包: {', '.join(missing)}")
+        print(f"[警告] --allow-missing 生成的是不完整开发包: {', '.join(missing)}")
     print(f"=== Full 版本完成: {destination} ===")
 
 
 def build_full(allow_missing: bool = False) -> Path:
+    metadata_errors = validate_release_metadata()
+    if metadata_errors:
+        raise SystemExit(
+            "[错误] release metadata 校验失败:\n- " + "\n- ".join(metadata_errors)
+        )
     destination = run_pyinstaller()
     assemble(destination, allow_missing)
     return destination
@@ -269,10 +261,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--allow-missing",
         action="store_true",
-        help="允许外部运行时/原生 helper/OCR 资源缺失，仅生成开发包",
+        help="允许 signed Widget/运行时/helper/OCR 等资源缺失，仅生成开发包",
     )
     args = parser.parse_args(argv)
-
     build_full(allow_missing=args.allow_missing)
 
 
