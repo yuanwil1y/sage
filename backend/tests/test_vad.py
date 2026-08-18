@@ -160,3 +160,20 @@ def test_finish_keeps_subframe_tail_when_speech_is_active() -> None:
 
     assert len(partial) == 1
     assert partial[0].shape[0] == FRAME_SIZE + 123
+
+
+def test_finish_does_not_reintroduce_unclassified_tail_after_silence() -> None:
+    seg = UtteranceSegmenter(
+        model=ScriptedModel([0.9, 0.1]),
+        min_silence_duration_ms=800,
+        speech_pad_ms=0,
+    )
+    audio = np.ones(FRAME_SIZE * 2 + 123, dtype=np.float32)
+
+    assert seg.process(audio) == []
+    partial = seg.finish()
+
+    assert len(partial) == 1
+    # One speech frame is kept; the classified silence frame and the unknown
+    # sub-frame tail after it are both trimmed.
+    assert partial[0].shape[0] == FRAME_SIZE
