@@ -1,0 +1,52 @@
+# ==== Python / build ====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ==== 大体积模型/运行时（不入库，由用户或安装器拉取）====
+*.gguf
+runtime/
+backend/models/hy-mt2/
+backend/models/asr/
+backend/dist/
+backend/resources/ocr/PP-OCRv6_medium_det_onnx/
+backend/resources/ocr/PP-OCRv6_medium_rec_onnx/
+backend/resources/silero_vad.onnx
+
+# ==== 工具私有数据 ====
+.reasonix/
+
+# ==== 编译产物 ====
+*.exe
+*.dll
+*.msix
+*.appx
+build/
+**/build/
+native/audio-capture/build/
+gamebar-widget/obj/
+gamebar-widget/bin/
+gamebar-widget/AppPackages/
+gamebar-widget/**/obj/
+gamebar-widget/ServicePayload/
+*.appxsym
+*.pfx
+*.cer
+
+# ==== 测试临时文件 ====
+*.pcm
+screenshots/
+logs/
+test_*.wav
+.tmp-*/
+.tmp-*.png
+
+# ==== 环境/本地配置 ====
+.env
+backend/config/package_identity.json
+backend/config/roi.json
+
+# ==== 系统 ====
+Thumbs.db
+Desktop.ini

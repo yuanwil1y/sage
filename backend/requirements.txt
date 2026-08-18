@@ -1,0 +1,3 @@
+# Sage backend 依赖（Python 3.11 x64）
+# Full 开发环境入口；同目录下的拆分文件只用于组织依赖分组。
+-r requirements-dev.txt

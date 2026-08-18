@@ -1,0 +1,7 @@
+# Headless translator, IPC, process monitoring, and shared data types.
+# These versions are verified together on Python 3.11 x64.  Upgrade them only
+# after running the frozen-build smoke tests as well as the source tests.
+numpy==2.3.5
+psutil==7.2.2
+httpx==0.28.1
+pywin32==312

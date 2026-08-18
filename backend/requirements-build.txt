@@ -1,0 +1,6 @@
+# Complete runtime plus PyInstaller
+-r requirements-voice.txt
+-r requirements-chat.txt
+-r requirements-ui.txt
+pyinstaller==6.22.1
+pyinstaller-hooks-contrib==2026.6

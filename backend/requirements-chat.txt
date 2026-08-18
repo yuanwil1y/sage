@@ -1,0 +1,7 @@
+# Screen chat OCR
+-r requirements-core.txt
+dxcam==0.3.0
+opencv-contrib-python==4.10.0.84
+paddleocr==3.7.0
+paddlex[ocr-core]==3.7.2
+rapidfuzz==3.14.5

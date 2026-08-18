@@ -1,0 +1,13 @@
+# Voice input: PCM resampling, Silero VAD ONNX, and Japanese ASR
+-r requirements-core.txt
+soxr==1.1.0
+onnxruntime==1.28.0
+faster-whisper==1.2.1
+
+# Binary/runtime dependencies used directly by faster-whisper.  Keeping them
+# explicit prevents a later transitive upgrade from silently changing the
+# native DLL set collected by PyInstaller.
+av==18.1.0
+ctranslate2==4.8.1
+huggingface-hub==1.27.0
+tokenizers==0.23.1
