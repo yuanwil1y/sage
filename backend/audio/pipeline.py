@@ -46,7 +46,16 @@ class AudioPipeline:
         )
 
     def feed_pcm(self, pcm_bytes: bytes) -> list[np.ndarray]:
-        """输入任意边界的 PCM s16le stereo 44.1k 字节，输出新完成的 utterances。"""
+        """Feed PCM bytes; ``b''`` is an internal capture-stream boundary marker.
+
+        The supervised native helper emits this marker immediately before a
+        replacement helper starts.  Resetting here prevents PCM byte carry,
+        soxr state, VAD pre-roll, and recurrent Silero state from leaking
+        across two different helper processes.
+        """
+        if not pcm_bytes:
+            self.reset()
+            return []
         mono_44k = self._normalizer.feed(pcm_bytes)
         audio_16k = self._resampler.process(mono_44k)
         return self._segmenter.process(audio_16k)
