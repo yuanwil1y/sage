@@ -1,12 +1,17 @@
-"""Runtime activation for models changed by the explicit Model Manager."""
+"""Keep runtime model services in sync with the local model store."""
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any
 
+from model_store import get_model_spec, model_file_path, model_status
+
 log = logging.getLogger("runtime.models")
+
+_TRACKED_MODELS = ("hy-mt2", "whisper-medium")
 
 
 class PassthroughTranslator:
@@ -21,8 +26,27 @@ class PassthroughTranslator:
         return text
 
 
+def _read_model_state(model_key: str) -> tuple[str, tuple[tuple[str, int, int], ...]]:
+    """Return install status plus a file fingerprint for replacement detection."""
+    spec = get_model_spec(model_key)
+    status = model_status(spec)
+    if status != "installed":
+        return status, ()
+
+    fingerprint: list[tuple[str, int, int]] = []
+    try:
+        for item in spec.files:
+            stat = model_file_path(spec, item).stat()
+            fingerprint.append((item.name, stat.st_size, stat.st_mtime_ns))
+    except OSError:
+        # A model directory can be replaced between status() and stat(). Treat
+        # that short race as an in-progress change and retry on the next poll.
+        return "changing", ()
+    return status, tuple(fingerprint)
+
+
 class RuntimeModelController:
-    """Apply Model Manager install/delete changes to a running orchestrator."""
+    """Hot-activate model installs/replacements and degrade safely on deletion."""
 
     def __init__(
         self,
@@ -31,6 +55,8 @@ class RuntimeModelController:
         *,
         translator_factory: Callable[[str], Any] | None = None,
         mt2_ready_timeout: float = 60.0,
+        watch_interval: float = 1.0,
+        state_reader: Callable[[str], object] | None = None,
     ) -> None:
         if translator_factory is None:
             from translation.hy_mt2_translator import HyMT2LocalTranslator
@@ -40,9 +66,81 @@ class RuntimeModelController:
         self.mt2_manager = mt2_manager
         self.translator_factory = translator_factory
         self.mt2_ready_timeout = float(mt2_ready_timeout)
+        self.watch_interval = max(0.1, float(watch_interval))
+        self._state_reader = state_reader or _read_model_state
+        self._last_states: dict[str, object] = {}
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        """Start a lightweight watcher without re-activating the initial state."""
+        if self.running:
+            return
+        self._last_states = {
+            key: self._safe_read_state(key) for key in _TRACKED_MODELS
+        }
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._watch_loop,
+            name="RuntimeModelWatcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+        self._thread = None
+
+    def _safe_read_state(self, model_key: str) -> object:
+        try:
+            return self._state_reader(model_key)
+        except Exception:
+            log.exception("读取模型状态失败: %s", model_key)
+            return ("error", ())
+
+    @staticmethod
+    def _status_of(state: object) -> str:
+        if isinstance(state, tuple) and state:
+            return str(state[0])
+        return str(state)
+
+    def refresh_once(self) -> None:
+        """Poll tracked model fingerprints once and apply stable state changes."""
+        for model_key in _TRACKED_MODELS:
+            current = self._safe_read_state(model_key)
+            previous = self._last_states.get(model_key, current)
+            if current == previous:
+                self._last_states[model_key] = current
+                continue
+
+            self._last_states[model_key] = current
+            old_status = self._status_of(previous)
+            new_status = self._status_of(current)
+
+            if new_status == "installed":
+                # Covers first install and atomic replacement while status stays
+                # installed but file size/mtime fingerprint changes.
+                self.handle_change(model_key, "下载")
+            elif old_status == "installed" and new_status != "installed":
+                self.handle_change(model_key, "删除")
+
+    def _watch_loop(self) -> None:
+        while not self._stop_event.wait(self.watch_interval):
+            try:
+                self.refresh_once()
+            except Exception:
+                # A watcher bug must not terminate the rest of Sage.
+                log.exception("运行时模型监控失败")
 
     def handle_change(self, model_key: str, action: str) -> None:
-        """React after a successful download/import/delete operation."""
+        """React to a stable install/import/replacement/delete transition."""
         if model_key == "hy-mt2":
             self._refresh_hy_mt2(action)
         elif model_key == "whisper-medium":
