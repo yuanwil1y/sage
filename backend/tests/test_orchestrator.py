@@ -230,6 +230,20 @@ def test_replace_translator_affects_subsequent_messages():
         orch.stop()
 
 
+def test_stop_drains_inflight_asr_before_translation_worker_exits():
+    orch, pipe, translator, transcriber = _make_orchestrator()
+    orch.handle_utterance(np.ones(16000, dtype=np.float32))
+
+    # Stop immediately instead of waiting for either worker. Graceful shutdown
+    # must let the queued ASR item reach translation before placing its stop.
+    orch.stop()
+
+    assert len(transcriber.calls) == 1
+    assert translator.calls == ["こんにちは"]
+    assert len(pipe.messages) == 1
+    assert pipe.messages[0]["translated"] == "译:こんにちは"
+
+
 def test_text_mode_does_not_construct_voice_chain():
     pipe = FakePipe()
     translator = FakeTranslator()
