@@ -177,3 +177,32 @@ def test_watcher_detects_delete_after_installed_state():
         assert mt2.calls == ["stop"]
     finally:
         controller.stop()
+
+
+def test_watcher_ignores_transient_state_during_atomic_replacement():
+    states = {
+        "hy-mt2": ("installed", (("model.gguf", 100, 1),)),
+        "whisper-medium": ("missing", ()),
+    }
+    orchestrator = FakeOrchestrator(FakeTranscriber())
+    mt2 = FakeMt2()
+    controller = RuntimeModelController(
+        orchestrator,
+        mt2,
+        translator_factory=FakeTranslator,
+        watch_interval=60.0,
+        state_reader=lambda key: states[key],
+    )
+    controller.start()
+    try:
+        states["hy-mt2"] = ("changing", ())
+        controller.refresh_once()
+        assert mt2.calls == []
+        assert orchestrator.translator is None
+
+        states["hy-mt2"] = ("installed", (("model.gguf", 100, 2),))
+        controller.refresh_once()
+        assert mt2.calls.count("start") == 1
+        assert isinstance(orchestrator.translator, FakeTranslator)
+    finally:
+        controller.stop()
