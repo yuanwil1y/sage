@@ -216,6 +216,12 @@ class AudioCaptureReader:
                     exit_code = proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     exit_code = proc.poll()
+                stderr_thread = self._stderr_thread
+                if (
+                    stderr_thread is not None
+                    and stderr_thread is not threading.current_thread()
+                ):
+                    stderr_thread.join(timeout=0.5)
             else:
                 exit_code = None
 
