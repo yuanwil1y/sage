@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from paths import native_exe_path
+from windows_capabilities import require_process_loopback_support
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class AudioCaptureReader:
         restart_max_delay: float = 8.0,
         restart_stable_seconds: float = 30.0,
         stderr_tail_bytes: int = 16 * 1024,
+        enforce_platform_support: bool | None = None,
     ) -> None:
         self.exe_path = Path(exe_path) if exe_path else _DEFAULT_EXE
         self.on_pcm = on_pcm
@@ -51,6 +53,9 @@ class AudioCaptureReader:
         self.restart_max_delay = max(self.restart_initial_delay, float(restart_max_delay))
         self.restart_stable_seconds = max(0.0, float(restart_stable_seconds))
         self.stderr_tail_bytes = max(1024, int(stderr_tail_bytes))
+        if enforce_platform_support is None:
+            enforce_platform_support = self.exe_path.name.lower() == "valorant_audio_capture.exe"
+        self.enforce_platform_support = bool(enforce_platform_support)
 
         self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
@@ -79,6 +84,8 @@ class AudioCaptureReader:
         return data.decode("utf-8", errors="replace").strip()
 
     def assert_available(self) -> None:
+        if self.enforce_platform_support:
+            require_process_loopback_support()
         if not self.exe_path.exists():
             raise FileNotFoundError(f"native helper 不存在: {self.exe_path}")
 
@@ -246,9 +253,6 @@ class AudioCaptureReader:
                 if self.on_before_restart is not None:
                     self.on_before_restart(target_pid, failure_count)
                 elif self.on_pcm is not None:
-                    # Internal stream-boundary marker. AudioPipeline.feed_pcm
-                    # treats b"" as reset-without-emitting, so DSP/VAD state
-                    # never leaks across two helper processes.
                     self.on_pcm(b"")
             except Exception:
                 log.exception("audio-capture restart/stream-reset 回调失败")
@@ -272,7 +276,4 @@ class AudioCaptureReader:
                 try:
                     self.on_pcm(chunk)
                 except Exception:
-                    # Producer callbacks must not kill the supervisor. The
-                    # orchestrator is expected to contain per-chunk failures,
-                    # but this is the final safety boundary.
                     log.exception("PCM 回调失败，继续读取 helper stdout")
