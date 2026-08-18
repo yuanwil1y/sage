@@ -71,6 +71,10 @@ class Transcriber:
             for name in ("config.json", "model.bin", "tokenizer.json", "vocabulary.txt")
         )
 
+    def reset_model(self) -> None:
+        """Drop the loaded model so the next utterance reloads current disk state."""
+        self._model = None
+
     def transcribe(self, audio_16k: np.ndarray) -> str:
         """转写一段日语语音为文本（整句）。空/过短音频返回空串。"""
         # 少于约 0.2 秒（16k * 0.2 = 3200 采样）视为无效
