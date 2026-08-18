@@ -17,6 +17,7 @@ from config.roi import load_roi_config
 from ipc import protocol
 from ipc.pipe_server import PipeServer
 from pipeline.orchestrator import TranslatorOrchestrator
+from runtime_models import PassthroughTranslator, RuntimeModelController
 from translation.hy_mt2_server import HyMT2ServerManager
 from translation.hy_mt2_translator import HyMT2LocalTranslator
 
@@ -26,13 +27,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+
 def packaged_ui_requested() -> bool:
     """Use the GUI by default for frozen desktop builds.
 
-    Source runs keep their historical headless default.  ``--headless`` remains
+    Source runs keep their historical headless default. ``--headless`` remains
     available for troubleshooting a packaged build without a visible window.
     """
-
     return "--headless" not in sys.argv and (
         "--ui" in sys.argv or bool(getattr(sys, "frozen", False))
     )
@@ -40,7 +41,6 @@ def packaged_ui_requested() -> bool:
 
 def cleanup_gamebar() -> int:
     """Remove the Game Bar package and its bundled certificate for uninstall."""
-
     from gamebar_manager import remove_widget_certificate, uninstall_widget
 
     cleanup_errors: list[str] = []
@@ -60,7 +60,6 @@ def cleanup_gamebar() -> int:
 
 def initialize_gamebar() -> int:
     """Install certificate, dependencies, widget package and loopback access."""
-
     from gamebar_manager import install_widget
 
     try:
@@ -91,6 +90,7 @@ def run(use_ui: bool = False) -> None:
     pipe: PipeServer | None = None
     mt2: HyMT2ServerManager | None = None
     orchestrator: TranslatorOrchestrator | None = None
+    model_controller: RuntimeModelController | None = None
     try:
         # 1. Named Pipe Server
         # 生产版 Game Bar 通信由 MSIX 内的 SageWidgetService 接管：
@@ -115,11 +115,7 @@ def run(use_ui: bool = False) -> None:
 
         if translator is None:
             # 缺少大模型时仍让用户打开 GUI、配置 ROI 和模型；链路测试时透传原文。
-            class _Passthrough:
-                def translate(self, text, source_lang="日语", target_lang="简体中文"):
-                    return text
-
-            translator = _Passthrough()
+            translator = PassthroughTranslator()
 
         preferences = load_preferences()
         orchestrator = TranslatorOrchestrator(pipe, translator, mode="full")
@@ -137,6 +133,12 @@ def run(use_ui: bool = False) -> None:
 
         roi_config = load_roi_config()
         orchestrator.start_all(roi_config)
+
+        # Keep the live runtime synchronized with explicit Model Manager changes
+        # (and manual local replacements) without requiring a Sage restart.
+        model_controller = RuntimeModelController(orchestrator, mt2)
+        model_controller.start()
+
         if orchestrator.voice_enabled:
             log.info("ProcessFinder 已启动，等待 VALORANT-Win64-Shipping.exe……")
         if orchestrator.chat_enabled and roi_config is None:
@@ -191,6 +193,8 @@ def run(use_ui: bool = False) -> None:
         except KeyboardInterrupt:
             log.info("收到中断，正在停止……")
     finally:
+        if model_controller is not None:
+            model_controller.stop()
         if orchestrator is not None:
             orchestrator.stop()
         if mt2 is not None:
