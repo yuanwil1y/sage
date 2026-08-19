@@ -31,7 +31,7 @@ jobs:
           pytest==9.1.1 numpy==2.3.5 soxr==1.1.0 rapidfuzz==3.14.5
       - name: Streaming, OCR, model and release regressions
         run: >-
-          pytest -q
+          python -m pytest -q
           tests/test_audio_normalize_resample.py
           tests/test_vad.py
           tests/test_ocr.py
@@ -60,7 +60,7 @@ jobs:
           pytest==9.1.1 numpy==2.3.5 soxr==1.1.0 rapidfuzz==3.14.5 pywin32==312
       - name: Run Windows-safe unit tests
         run: >-
-          pytest -q -m "not windows_integration"
+          python -m pytest -q -m "not windows_integration"
           tests/test_capture_reader.py
           tests/test_orchestrator.py
           tests/test_audio_normalize_resample.py
