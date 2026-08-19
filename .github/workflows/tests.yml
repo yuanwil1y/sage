@@ -57,7 +57,7 @@ jobs:
       - name: Install focused Windows test dependencies
         run: >-
           python -m pip install --upgrade pip
-          pytest==9.1.1 numpy==2.3.5 soxr==1.1.0 rapidfuzz==3.14.5 pywin32==312
+          pytest==9.1.1 numpy==2.3.5 soxr==1.1.0 rapidfuzz==3.14.5 pywin32==312 httpx==0.28.1
       - name: Run Windows-safe unit tests
         run: >-
           python -m pytest -q -m "not windows_integration"
