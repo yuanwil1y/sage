@@ -1,12 +1,10 @@
 """PipeServer 集成测试：模拟 Game Bar Widget 客户端连接并读取 NDJSON。"""
 
-import threading
 import time
 import uuid
 
 import pywintypes
 import win32file
-import win32pipe
 
 from ipc import protocol
 from ipc.pipe_server import PipeServer
@@ -15,7 +13,7 @@ from models.messages import TranslationResult
 _READ_TIMEOUT_MS = 3000
 
 
-def _read_line(handle, timeout_ms: int = _READ_TIMEOUT_MS) -> bytes:
+def _read_line(handle, timeout_ms: int = _READ_TIMEOUT_MS) -> bytes:  # noqa: ARG001
     """从 message-mode pipe 读一条完整消息。"""
     _, data = win32file.ReadFile(handle, 65536)
     return data
@@ -28,7 +26,7 @@ def _test_pipe_name() -> str:
 def _connect_client(pipe_name: str) -> object:
     """模拟 Widget：打开 pipe 客户端（带重试）。"""
     last_exc: Exception | None = None
-    for _ in range(50):  # 最多约 5 秒
+    for _ in range(50):
         try:
             return win32file.CreateFile(
                 pipe_name,
@@ -115,8 +113,6 @@ def test_client_reconnect_after_disconnect() -> None:
     try:
         client1 = _connect_client(pipe_name)
         client1.Close()
-        # The server sends its own periodic heartbeat. This must notice a
-        # stale client even when the Python headless main is not running.
         deadline = time.monotonic() + 3.0
         while server.client_connected and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -133,3 +129,28 @@ def test_client_reconnect_after_disconnect() -> None:
         client2.Close()
     finally:
         server.stop()
+
+
+def test_stop_cancels_write_when_connected_client_never_reads() -> None:
+    """连接但不读的客户端不能把 PipeServer 卡死在 WriteFile。"""
+    pipe_name = _test_pipe_name()
+    server = PipeServer(pipe_name=pipe_name, write_timeout_ms=1000)
+    server.start()
+    client = _connect_client(pipe_name)
+    try:
+        _wait_connected(server)
+        # Far larger than the configured 64 KiB outbound pipe buffer. A client
+        # that never reads should force the overlapped write to remain pending.
+        server.broadcast({"v": 1, "type": "fault-injection", "data": "x" * (8 * 1024 * 1024)})
+        time.sleep(0.1)
+
+        started = time.monotonic()
+        server.stop(timeout=1.5)
+        elapsed = time.monotonic() - started
+
+        assert not server.is_alive()
+        assert elapsed < 1.5
+    finally:
+        client.Close()
+        if server.is_alive():
+            server.stop(timeout=2.0)
