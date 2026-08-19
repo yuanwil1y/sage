@@ -86,6 +86,26 @@ def test_resolve_preserves_saved_nonzero_device_when_valid():
     assert resolved.device_idx == 1
 
 
+def test_new_selection_does_not_trust_provisional_qt_index_when_ambiguous():
+    outputs = parse_output_info(
+        "Device[0] Output[0]: Res:(1920, 1080) Rot:0 Primary:False\n"
+        "Device[1] Output[0]: Res:(1920, 1080) Rot:0 Primary:False\n"
+    )
+
+    # Even though the provisional Qt hint happens to point at Device[0]/0,
+    # there are two equally valid physical outputs. A brand-new selection must
+    # fail instead of persisting an arbitrary cross-GPU mapping.
+    with pytest.raises(ValueError, match="多个"):
+        resolve_output(
+            outputs,
+            saved_device_idx=0,
+            saved_output_idx=0,
+            expected_size=(1920, 1080),
+            primary=False,
+            prefer_saved=False,
+        )
+
+
 def test_resolve_rejects_ambiguous_or_missing_monitor():
     outputs = parse_output_info(
         "Device[0] Output[0]: Res:(1920, 1080) Rot:0 Primary:False\n"
