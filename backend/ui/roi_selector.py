@@ -5,6 +5,12 @@ from __future__ import annotations
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from config.roi import RoiConfig
+from screen.display_mapping import (
+    output_local_region,
+    parse_output_info,
+    physical_size,
+    resolve_output,
+)
 
 
 class RegionSelectorDialog(QtWidgets.QDialog):
@@ -40,23 +46,63 @@ class RegionSelectorDialog(QtWidgets.QDialog):
             return None
 
         geometry = self._screen.geometry()
-        # Qt keeps the virtual desktop origin in native desktop coordinates on
-        # Windows but reports each screen's size in device-independent pixels.
-        # Scale only the local selection; scaling the global origin breaks
-        # monitors placed left/above the primary display.
         handle = self.windowHandle()
         scale = float(
             handle.devicePixelRatio()
             if handle is not None
             else self._screen.devicePixelRatio()
         )
-        left = geometry.left() + round(self._selection.left() * scale)
-        top = geometry.top() + round(self._selection.top() * scale)
-        right = geometry.left() + round((self._selection.right() + 1) * scale)
-        bottom = geometry.top() + round((self._selection.bottom() + 1) * scale)
+
+        # DXcam's region is relative to one output, so never add the virtual
+        # desktop origin here. Only scale the screen-local logical rectangle.
+        local_region = output_local_region(
+            (
+                self._selection.left(),
+                self._selection.top(),
+                self._selection.right() + 1,
+                self._selection.bottom() + 1,
+            ),
+            scale,
+        )
+
         screens = QtGui.QGuiApplication.screens()
-        output_idx = screens.index(self._screen) if self._screen in screens else 0
+        qt_index = screens.index(self._screen) if self._screen in screens else 0
         primary = QtGui.QGuiApplication.primaryScreen()
+        is_primary = self._screen == primary
+        device_idx = 0
+        output_idx = qt_index
+
+        # Resolve the Qt screen to an actual DXcam device/output while the user
+        # is selecting it. The Qt index remains only a hint; physical size and
+        # primary status validate/remap across all adapters. Ambiguous mappings
+        # are rejected instead of silently capturing another monitor.
+        try:
+            import dxcam
+
+            outputs = parse_output_info(dxcam.output_info())
+            if outputs:
+                resolved = resolve_output(
+                    outputs,
+                    saved_device_idx=0,
+                    saved_output_idx=qt_index,
+                    expected_size=physical_size(
+                        (
+                            geometry.left(),
+                            geometry.top(),
+                            geometry.width(),
+                            geometry.height(),
+                        ),
+                        scale,
+                    ),
+                    primary=is_primary,
+                )
+                device_idx = resolved.device_idx
+                output_idx = resolved.output_idx
+        except ImportError as exc:
+            raise RuntimeError("DXcam 未安装，无法确认聊天区域所在显示器") from exc
+        except Exception as exc:
+            raise RuntimeError(f"无法确认聊天区域所在显示器：{exc}") from exc
+
         serial = ""
         try:
             serial = self._screen.serialNumber() or ""
@@ -64,10 +110,9 @@ class RegionSelectorDialog(QtWidgets.QDialog):
             pass
         return RoiConfig(
             output_idx,
-            left,
-            top,
-            right,
-            bottom,
+            *local_region,
+            device_idx=device_idx,
+            coordinate_space="output",
             screen_name=self._screen.name() or None,
             screen_serial=serial or None,
             screen_geometry=(
@@ -77,7 +122,7 @@ class RegionSelectorDialog(QtWidgets.QDialog):
                 geometry.height(),
             ),
             device_pixel_ratio=scale,
-            screen_primary=self._screen == primary,
+            screen_primary=is_primary,
         )
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: ARG002
@@ -117,7 +162,12 @@ class RegionSelectorDialog(QtWidgets.QDialog):
             self._selection = QtCore.QRect(self._start, event.position().toPoint()).normalized()
             self._start = None
             self.update()
-            if self.selected_roi() is not None:
+            try:
+                roi = self.selected_roi()
+            except RuntimeError as exc:
+                QtWidgets.QMessageBox.warning(self, "无法选择显示器", str(exc))
+                return
+            if roi is not None:
                 self.accept()
         super().mouseReleaseEvent(event)
 
