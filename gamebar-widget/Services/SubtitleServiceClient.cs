@@ -79,14 +79,22 @@ namespace ValorantTranslator.Services
             string session = batch.ContainsKey("session")
                 ? batch.GetNamedString("session", "")
                 : "";
-            if (!string.IsNullOrEmpty(session)
+
+            bool sessionChanged = !string.IsNullOrEmpty(session)
                 && !string.IsNullOrEmpty(_session)
-                && !string.Equals(session, _session, StringComparison.Ordinal))
+                && !string.Equals(session, _session, StringComparison.Ordinal);
+            if (sessionChanged)
             {
-                // Event ids restart at 1 after the local service restarts.
-                // Clear the visual store and resume from the new epoch.
+                // The numeric cursor only has meaning inside one service
+                // process. The request that discovered this new session was
+                // still sent with the old session's cursor, so its batch
+                // cursor/events cannot be used safely. Reset and force the
+                // next poll to start at zero, which replays the new service's
+                // retained events instead of skipping them.
+                _session = session;
                 _cursor = 0;
                 _store.Clear();
+                return;
             }
             if (!string.IsNullOrEmpty(session)) _session = session;
 
