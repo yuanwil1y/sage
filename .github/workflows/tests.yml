@@ -112,10 +112,16 @@ jobs:
           if (-not (Test-Path "gamebar-widget/ServicePayload/SageWidgetService.exe")) {
             throw "service build did not produce SageWidgetService.exe"
           }
-      - name: Compile Game Bar widget project
-        run: >-
-          msbuild gamebar-widget\ValorantTranslator.csproj
-          /restore /t:Rebuild /p:Configuration=Release /p:Platform=x64 /m
+      - name: Build unsigned Game Bar MSIX/AppX
+        run: |
+          & .\gamebar-widget\build.ps1 -Configuration Release
+          $package = Get-ChildItem gamebar-widget\AppPackages -Recurse -File |
+            Where-Object { $_.Extension -in '.msix', '.appx' } |
+            Select-Object -First 1
+          if (-not $package) {
+            throw "Game Bar build did not produce an unsigned MSIX/AppX"
+          }
+          Write-Host "Built package: $($package.FullName)"
       - name: Run artifact-dependent Windows integration tests
         working-directory: backend
         run: >-
@@ -123,6 +129,6 @@ jobs:
           tests/test_capture_reader.py
           tests/test_widget_service.py
 
-  # Full signed MSIX installation, Game Bar activation, VALORANT process audio,
-  # and physical multi-monitor/DPI acceptance still require an interactive
-  # Windows machine. CI intentionally stops at compile + local-service chain.
+  # Signing/certificate installation, Game Bar activation, VALORANT process
+  # audio, and physical multi-monitor/DPI acceptance still require an
+  # interactive Windows machine. CI stops at unsigned package + local chain.
