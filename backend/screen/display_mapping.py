@@ -117,22 +117,18 @@ def resolve_output(
     saved_output_idx: int,
     expected_size: tuple[int, int] | None = None,
     primary: bool | None = None,
+    prefer_saved: bool = True,
 ) -> DxcamOutput:
-    """Validate/remap a persisted DXcam ``(device_idx, output_idx)`` pair.
+    """Validate/remap a DXcam ``(device_idx, output_idx)`` pair.
 
-    Prefer the persisted pair when its physical fingerprint still matches. If
-    display/GPU enumeration changed, select a unique matching output across all
-    adapters. Ambiguity fails loudly rather than capturing the wrong monitor.
+    ``prefer_saved=True`` is appropriate for a pair that was previously
+    resolved and persisted. During a brand-new Qt selection the pair is only a
+    provisional index hint, so callers use ``prefer_saved=False`` and require a
+    unique physical match across all adapters.
     """
     available = list(outputs)
     if not available:
-        return DxcamOutput(
-            device_idx=saved_device_idx,
-            output_idx=saved_output_idx,
-            width=expected_size[0] if expected_size else 0,
-            height=expected_size[1] if expected_size else 0,
-            primary=bool(primary),
-        )
+        raise ValueError("DXcam 未返回可用显示器，请重新选择聊天区域")
 
     saved = next(
         (
@@ -145,10 +141,10 @@ def resolve_output(
     )
 
     if expected_size is None:
-        if saved is not None:
+        if prefer_saved and saved is not None:
             return saved
         raise ValueError(
-            f"DXcam 输出 Device[{saved_device_idx}] Output[{saved_output_idx}] 不存在"
+            f"DXcam 输出 Device[{saved_device_idx}] Output[{saved_output_idx}] 无法确认"
         )
 
     def matches(item: DxcamOutput) -> bool:
@@ -156,7 +152,7 @@ def resolve_output(
             primary is None or item.primary == primary
         )
 
-    if saved is not None and matches(saved):
+    if prefer_saved and saved is not None and matches(saved):
         return saved
 
     candidates = [item for item in available if matches(item)]
@@ -184,4 +180,5 @@ def resolve_output_index(
         saved_output_idx=saved_output_idx,
         expected_size=expected_size,
         primary=primary,
+        prefer_saved=True,
     ).output_idx
