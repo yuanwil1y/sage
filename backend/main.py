@@ -15,27 +15,19 @@ import time
 from config.preferences import load_preferences
 from config.roi import load_roi_config
 from ipc.pipe_server import PipeServer
+from paths import native_exe_path
 from pipeline.orchestrator import TranslatorOrchestrator
 from runtime_models import PassthroughTranslator, RuntimeModelController
+from startup_options import packaged_ui_requested, resolve_use_ui
 from translation.hy_mt2_server import HyMT2ServerManager
 from translation.hy_mt2_translator import HyMT2LocalTranslator
+from windows_capabilities import voice_capture_status
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 log = logging.getLogger("main")
-
-
-def packaged_ui_requested() -> bool:
-    """Use the GUI by default for frozen desktop builds.
-
-    Source runs keep their historical headless default. ``--headless`` remains
-    available for troubleshooting a packaged build without a visible window.
-    """
-    return "--headless" not in sys.argv and (
-        "--ui" in sys.argv or bool(getattr(sys, "frozen", False))
-    )
 
 
 def cleanup_gamebar() -> int:
@@ -161,10 +153,11 @@ def run(use_ui: bool = False) -> None:
             )
             window.set_status(
                 "Voice",
-                (
-                    "ASR: ready"
-                    if getattr(orchestrator.transcriber, "model_available", False)
-                    else "ASR model: not installed"
+                voice_capture_status(
+                    model_available=bool(
+                        getattr(orchestrator.transcriber, "model_available", False)
+                    ),
+                    helper_available=native_exe_path().exists(),
                 )
                 if orchestrator.voice_enabled
                 else "ASR: disabled in this edition",
@@ -208,9 +201,14 @@ def run(use_ui: bool = False) -> None:
             uninstall_gui_logging(gui_log_handler)
 
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sage runtime")
     parser.add_argument("--ui", action="store_true", help="启动桌面控制界面")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="打包版不打开桌面界面（故障排查/自动化）",
+    )
     parser.add_argument(
         "--cleanup-gamebar",
         action="store_true",
@@ -221,10 +219,19 @@ if __name__ == "__main__":
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
     if args.cleanup_gamebar:
         raise SystemExit(cleanup_gamebar())
     elif args.initialize_gamebar:
         raise SystemExit(initialize_gamebar())
     else:
-        run(use_ui=args.ui or packaged_ui_requested())
+        run(
+            use_ui=resolve_use_ui(
+                ui_requested=args.ui,
+                headless_requested=args.headless,
+            )
+        )

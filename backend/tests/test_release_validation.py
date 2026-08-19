@@ -13,6 +13,7 @@ from windows_capabilities import (
     UnsupportedWindowsBuildError,
     process_loopback_support,
     require_process_loopback_support,
+    voice_capture_status,
 )
 
 
@@ -47,6 +48,11 @@ def test_process_loopback_gate_rejects_old_windows(monkeypatch):
     with pytest.raises(UnsupportedWindowsBuildError):
         require_process_loopback_support()
 
+    status = voice_capture_status(model_available=True, helper_available=True)
+    assert "Voice capture unavailable" in status
+    assert str(MIN_PROCESS_LOOPBACK_BUILD) in status
+    assert "Text chat translation remains available" in status
+
 
 def test_process_loopback_gate_accepts_supported_windows(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
@@ -58,3 +64,15 @@ def test_process_loopback_gate_accepts_supported_windows(monkeypatch):
     )
     assert process_loopback_support().supported
     require_process_loopback_support()
+    assert (
+        voice_capture_status(model_available=True, helper_available=True)
+        == "ASR: ready"
+    )
+    assert (
+        voice_capture_status(model_available=False, helper_available=True)
+        == "ASR model: not installed"
+    )
+    assert (
+        voice_capture_status(model_available=True, helper_available=False)
+        == "Audio capture helper: not installed"
+    )
