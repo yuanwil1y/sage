@@ -118,12 +118,17 @@ class ChatOcrWorker:
         if not 0 <= min_score <= 1:
             raise ValueError("min_score must be between 0 and 1")
         self.region = region
+        # Resolve/migrate the persisted coordinate contract once. Legacy files
+        # that cannot be converted safely fail at worker construction so the UI
+        # can ask for a new selection instead of logging the same error at 4 Hz.
+        self._capture_region = region.region
         self.on_line = on_line
         self.on_status = on_status
         self.poll_hz = poll_hz
         self.min_score = min_score
         self.capture: FrameCapture = capture or ScreenCapture(
             region.output_idx,
+            device_idx=region.device_idx,
             screen_geometry=region.screen_geometry,
             device_pixel_ratio=region.device_pixel_ratio,
             screen_primary=region.screen_primary,
@@ -219,7 +224,7 @@ class ChatOcrWorker:
             while not self._stop_event.is_set():
                 started = time.monotonic()
                 try:
-                    frame = self.capture.grab(self.region.region)
+                    frame = self.capture.grab(self._capture_region)
                     if self.change_detector.changed(frame):
                         self.process_frame(frame)
                 except OcrInitializationError as exc:
@@ -230,7 +235,6 @@ class ChatOcrWorker:
                     log.exception("聊天 OCR 轮询失败")
                     self._report_status(f"OCR: error ({exc})")
                 elapsed = time.monotonic() - started
-                # poll_hz may be changed from the UI while this worker is live.
                 interval = 1.0 / self.poll_hz
                 self._stop_event.wait(max(0.0, interval - elapsed))
         finally:

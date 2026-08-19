@@ -11,17 +11,22 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from paths import config_dir
+from screen.display_mapping import legacy_desktop_region_to_output_local
 
 log = logging.getLogger(__name__)
+
+_COORD_OUTPUT = "output"
+_COORD_LEGACY_DESKTOP = "legacy-desktop"
 
 
 @dataclass(frozen=True, slots=True)
 class RoiConfig:
-    """A physical-pixel DXcam region.
+    """A physical-pixel region for one DXcam output.
 
-    Coordinates are absolute desktop coordinates in the same coordinate
-    space accepted by ``dxcam.grab(region=...)``.  Negative left/top values
-    are valid for monitors positioned left/above the primary display.
+    New configurations store coordinates relative to the selected output, not
+    the Windows virtual desktop. ``device_idx`` + ``output_idx`` identify the
+    DXcam camera. Configs written by the pre-fix 1.0.14 selector are loaded as
+    ``legacy-desktop`` and converted lazily from their saved screen geometry.
     """
 
     output_idx: int
@@ -29,8 +34,10 @@ class RoiConfig:
     top: int
     right: int
     bottom: int
+    device_idx: int = 0
+    coordinate_space: str = _COORD_OUTPUT
     # Optional screen fingerprint. Old configs without these fields remain
-    # readable, but newly selected regions can be validated against DXcam.
+    # readable where possible, but unsafe legacy coordinates require reselect.
     screen_name: str | None = None
     screen_serial: str | None = None
     screen_geometry: tuple[int, int, int, int] | None = None
@@ -38,13 +45,19 @@ class RoiConfig:
     screen_primary: bool | None = None
 
     def __post_init__(self) -> None:
+        if self.device_idx < 0:
+            raise ValueError("device_idx must be non-negative")
         if self.output_idx < 0:
             raise ValueError("output_idx must be non-negative")
+        if self.coordinate_space not in {_COORD_OUTPUT, _COORD_LEGACY_DESKTOP}:
+            raise ValueError(f"unknown ROI coordinate space: {self.coordinate_space}")
         if self.right <= self.left or self.bottom <= self.top:
             raise ValueError(
                 "ROI must have positive size: "
                 f"({self.left}, {self.top}, {self.right}, {self.bottom})"
             )
+        if self.coordinate_space == _COORD_OUTPUT and (self.left < 0 or self.top < 0):
+            raise ValueError("output-local ROI coordinates must be non-negative")
         if self.screen_geometry is not None:
             if len(self.screen_geometry) != 4:
                 raise ValueError("screen_geometry must contain four integers")
@@ -59,12 +72,24 @@ class RoiConfig:
             raise ValueError("device_pixel_ratio must be positive")
 
     @property
-    def region(self) -> tuple[int, int, int, int]:
+    def raw_region(self) -> tuple[int, int, int, int]:
         return self.left, self.top, self.right, self.bottom
+
+    @property
+    def region(self) -> tuple[int, int, int, int]:
+        """Return the DXcam-ready output-local physical region."""
+        if self.coordinate_space == _COORD_OUTPUT:
+            return self.raw_region
+        return legacy_desktop_region_to_output_local(
+            self.raw_region,
+            self.screen_geometry,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
+            "device_idx": self.device_idx,
             "output_idx": self.output_idx,
+            "coordinate_space": self.coordinate_space,
             "left": self.left,
             "top": self.top,
             "right": self.right,
@@ -89,17 +114,23 @@ class RoiConfig:
         if missing:
             raise ValueError(f"ROI config missing keys: {', '.join(missing)}")
         try:
-            values = {key: int(data[key]) for key in keys}
+            values: dict[str, Any] = {key: int(data[key]) for key in keys}
+            values["device_idx"] = int(data.get("device_idx", 0))
         except (TypeError, ValueError) as exc:
-            raise ValueError("ROI coordinates must be integers") from exc
+            raise ValueError("ROI coordinates/device indices must be integers") from exc
         screen_geometry = data.get("screen_geometry")
         if screen_geometry is not None:
             try:
                 screen_geometry = tuple(int(value) for value in screen_geometry)
             except (TypeError, ValueError) as exc:
                 raise ValueError("screen_geometry must contain integers") from exc
+        # Old files did not record a coordinate-space marker. They were written
+        # by a selector that added the virtual-desktop origin to local physical
+        # pixels, so treat them as legacy instead of silently misreading them.
+        coordinate_space = str(data.get("coordinate_space") or _COORD_LEGACY_DESKTOP)
         values.update(
             {
+                "coordinate_space": coordinate_space,
                 "screen_name": str(data["screen_name"])
                 if data.get("screen_name")
                 else None,
@@ -127,12 +158,7 @@ def default_roi_path() -> Path:
 
 
 def load_roi_config(path: Path | str | None = None) -> RoiConfig | None:
-    """Load a saved ROI, returning ``None`` when it is not configured.
-
-    A malformed user config is treated as unconfigured and logged.  This
-    keeps the backend startable after a manually edited config file breaks.
-    """
-
+    """Load a saved ROI, returning ``None`` when it is not configured."""
     target = Path(path) if path is not None else default_roi_path()
     if not target.exists():
         return None
@@ -146,7 +172,6 @@ def load_roi_config(path: Path | str | None = None) -> RoiConfig | None:
 
 def save_roi_config(config: RoiConfig, path: Path | str | None = None) -> Path:
     """Atomically save an ROI config and return its destination path."""
-
     target = Path(path) if path is not None else default_roi_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(

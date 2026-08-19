@@ -29,7 +29,7 @@ jobs:
         run: >-
           python -m pip install --upgrade pip
           pytest==9.1.1 numpy==2.3.5 soxr==1.1.0 rapidfuzz==3.14.5
-      - name: Streaming, OCR, model and release regressions
+      - name: Streaming, OCR, display, model and release regressions
         run: >-
           python -m pytest -q
           tests/test_audio_normalize_resample.py
@@ -37,13 +37,16 @@ jobs:
           tests/test_ocr.py
           tests/test_transcriber.py
           tests/test_runtime_models.py
+          tests/test_roi.py
+          tests/test_display_mapping.py
+          tests/test_screen_capture.py
           tests/test_release_validation.py
       - name: Validate release metadata
         run: python release_validation.py
 
   windows-python:
     name: Windows Python / supervision regressions
-    runs-on: windows-latest
+    runs-on: windows-2022
     defaults:
       run:
         working-directory: backend
@@ -66,10 +69,66 @@ jobs:
           tests/test_audio_normalize_resample.py
           tests/test_vad.py
           tests/test_runtime_models.py
+          tests/test_roi.py
+          tests/test_display_mapping.py
+          tests/test_screen_capture.py
+          tests/test_pipe_server.py
           tests/test_release_validation.py
       - name: Validate release metadata
         run: python release_validation.py
 
-  # Tests marked windows_integration intentionally require artifacts produced
-  # by the native/MSIX build pipeline. They remain separate from the unit gate
-  # so a missing local release artifact is never silently treated as a pass.
+  windows-artifact-integration:
+    name: Windows native / Game Bar integration
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-test.txt
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+      - name: Install integration test dependencies
+        working-directory: backend
+        run: >-
+          python -m pip install --upgrade pip;
+          python -m pip install pytest==9.1.1 pywin32==312 requests==2.32.5
+      - name: Build native process-loopback helper
+        run: |
+          cmake -S native/audio-capture -B native/audio-capture/build -A x64
+          cmake --build native/audio-capture/build --config Release --parallel
+          if (-not (Test-Path "native/audio-capture/build/Release/valorant_audio_capture.exe")) {
+            throw "native helper build did not produce valorant_audio_capture.exe"
+          }
+      - name: Build Game Bar local service
+        run: |
+          msbuild gamebar-widget\Service\SageWidgetService.csproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /m
+          if (-not (Test-Path "gamebar-widget/ServicePayload/SageWidgetService.exe")) {
+            throw "service build did not produce SageWidgetService.exe"
+          }
+      - name: Build unsigned Game Bar MSIX/AppX
+        run: |
+          & .\gamebar-widget\build.ps1 -Configuration Release
+          $package = Get-ChildItem gamebar-widget\AppPackages -Recurse -File |
+            Where-Object { $_.Extension -in '.msix', '.appx' } |
+            Select-Object -First 1
+          if (-not $package) {
+            throw "Game Bar build did not produce an unsigned MSIX/AppX"
+          }
+          Write-Host "Built package: $($package.FullName)"
+      - name: Run artifact-dependent Windows integration tests
+        working-directory: backend
+        run: >-
+          python -m pytest -q -m windows_integration
+          tests/test_capture_reader.py
+          tests/test_widget_service.py
+
+  # Signing/certificate installation, Game Bar activation, VALORANT process
+  # audio, and physical multi-monitor/DPI acceptance still require an
+  # interactive Windows machine. CI stops at unsigned package + local chain.
