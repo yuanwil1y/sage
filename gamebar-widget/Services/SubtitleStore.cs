@@ -140,6 +140,12 @@ namespace ValorantTranslator.Services
             // 1. 过期清理
             _entries.RemoveAll(e => e.IsExpired(now));
 
+            // Keep the backing list oldest -> newest before enforcing limits.
+            // Pruning by source can then safely remove the oldest matching
+            // entries without relying on indices captured before the list was
+            // mutated.
+            _entries.Sort((a, b) => a.CreatedAt.CompareTo(b.CreatedAt));
+
             // 2. 每类最多 3 条（保留最新）
             PruneSource("voice");
             PruneSource("chat");
@@ -149,27 +155,35 @@ namespace ValorantTranslator.Services
             {
                 _entries.RemoveAt(0);
             }
-
-            // 4. 按创建时间升序（旧在前，新在后）
-            _entries.Sort((a, b) => a.CreatedAt.CompareTo(b.CreatedAt));
         }
 
         private void PruneSource(string source)
         {
-            // 统计该 source 的数量，超出则从最旧移除
-            var indices = new List<int>();
+            int count = 0;
             for (int i = 0; i < _entries.Count; ++i)
             {
-                if (_entries[i].Source == source)
+                if (string.Equals(_entries[i].Source, source, StringComparison.OrdinalIgnoreCase))
                 {
-                    indices.Add(i);
+                    count += 1;
                 }
             }
-            // indices 升序（旧的索引小），超出部分从最旧（索引最小）开始移除
-            int overflow = indices.Count - MaxPerSource;
-            for (int j = 0; j < overflow; ++j)
+
+            int overflow = count - MaxPerSource;
+            if (overflow <= 0) return;
+
+            // The list is sorted oldest -> newest. Remove the oldest matching
+            // entries in-place. Do not cache indices: every RemoveAt shifts the
+            // remaining list and stale ascending indices can delete another
+            // source entirely.
+            for (int i = 0; i < _entries.Count && overflow > 0;)
             {
-                _entries.RemoveAt(indices[j]);
+                if (string.Equals(_entries[i].Source, source, StringComparison.OrdinalIgnoreCase))
+                {
+                    _entries.RemoveAt(i);
+                    overflow -= 1;
+                    continue;
+                }
+                i += 1;
             }
         }
 
