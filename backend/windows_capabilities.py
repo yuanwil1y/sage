@@ -27,7 +27,7 @@ class ProcessLoopbackSupport:
 
 
 class UnsupportedWindowsBuildError(FileNotFoundError):
-    """Caught by the existing capture-start path and surfaced as a clear error."""
+    """Raised when per-process loopback is unavailable on the current OS."""
 
 
 def process_loopback_support() -> ProcessLoopbackSupport:
@@ -40,6 +40,23 @@ def process_loopback_support() -> ProcessLoopbackSupport:
         return ProcessLoopbackSupport(False, None)
     build = int(sys.getwindowsversion().build)
     return ProcessLoopbackSupport(build >= MIN_PROCESS_LOOPBACK_BUILD, build)
+
+
+def voice_capture_status(*, model_available: bool, helper_available: bool) -> str:
+    """Return the most useful initial UI status for the voice feature.
+
+    Capability errors take precedence over model/helper checks so an old
+    Windows build is not misdiagnosed as a missing ASR model. Text chat remains
+    independent and usable when this status reports voice as unavailable.
+    """
+    support = process_loopback_support()
+    if not support.supported:
+        return f"Voice capture unavailable: {support.message}"
+    if not helper_available:
+        return "Audio capture helper: not installed"
+    if not model_available:
+        return "ASR model: not installed"
+    return "ASR: ready"
 
 
 def require_process_loopback_support() -> None:
