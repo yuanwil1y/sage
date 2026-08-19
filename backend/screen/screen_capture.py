@@ -53,30 +53,32 @@ class ScreenCapture:
             ):
                 try:
                     outputs = parse_output_info(output_info())
-                    if outputs:
-                        resolved = resolve_output(
-                            outputs,
-                            saved_device_idx=self._device_idx,
-                            saved_output_idx=self._output_idx,
-                            expected_size=physical_size(
-                                self._screen_geometry, self._device_pixel_ratio
-                            ),
-                            primary=self._screen_primary,
-                        )
-                        device_idx = resolved.device_idx
-                        output_idx = resolved.output_idx
-                        if (device_idx, output_idx) != (
+                    if not outputs:
+                        raise ValueError("DXcam 未返回可解析的显示器列表")
+                    resolved = resolve_output(
+                        outputs,
+                        saved_device_idx=self._device_idx,
+                        saved_output_idx=self._output_idx,
+                        expected_size=physical_size(
+                            self._screen_geometry, self._device_pixel_ratio
+                        ),
+                        primary=self._screen_primary,
+                        prefer_saved=True,
+                    )
+                    device_idx = resolved.device_idx
+                    output_idx = resolved.output_idx
+                    if (device_idx, output_idx) != (
+                        self._device_idx,
+                        self._output_idx,
+                    ):
+                        log.info(
+                            "显示器枚举已变化，ROI 输出从 Device[%d] Output[%d] "
+                            "映射到 Device[%d] Output[%d]",
                             self._device_idx,
                             self._output_idx,
-                        ):
-                            log.info(
-                                "显示器枚举已变化，ROI 输出从 Device[%d] Output[%d] "
-                                "映射到 Device[%d] Output[%d]",
-                                self._device_idx,
-                                self._output_idx,
-                                device_idx,
-                                output_idx,
-                            )
+                            device_idx,
+                            output_idx,
+                        )
                 except Exception as exc:
                     raise RuntimeError(f"无法确认聊天区域所在显示器：{exc}") from exc
 
