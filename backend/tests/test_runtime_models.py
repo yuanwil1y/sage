@@ -18,20 +18,30 @@ class FakeOrchestrator:
 
 
 class FakeMt2:
-    def __init__(self, *, fail_ready=False):
+    def __init__(self, *, fail_ready=False, fail_ready_count=0):
         self.base_url = "http://127.0.0.1:18088"
         self.fail_ready = fail_ready
+        self.fail_ready_count = int(fail_ready_count)
         self.calls = []
+        self._running = False
+
+    @property
+    def running(self):
+        return self._running
 
     def stop(self):
         self.calls.append("stop")
+        self._running = False
 
     def start(self):
         self.calls.append("start")
+        self._running = True
 
     def wait_ready(self, timeout):
         self.calls.append(("wait", timeout))
-        if self.fail_ready:
+        if self.fail_ready or self.fail_ready_count > 0:
+            if self.fail_ready_count > 0:
+                self.fail_ready_count -= 1
             raise RuntimeError("not ready")
 
 
@@ -204,5 +214,45 @@ def test_watcher_ignores_transient_state_during_atomic_replacement():
         controller.refresh_once()
         assert mt2.calls.count("start") == 1
         assert isinstance(orchestrator.translator, FakeTranslator)
+    finally:
+        controller.stop()
+
+
+def test_installed_hy_mt2_retries_after_transient_runtime_failure():
+    now = [100.0]
+    states = {
+        "hy-mt2": ("installed", (("model.gguf", 100, 1),)),
+        "whisper-medium": ("missing", ()),
+    }
+    orchestrator = FakeOrchestrator(FakeTranscriber())
+    orchestrator.translator = PassthroughTranslator()
+    mt2 = FakeMt2(fail_ready_count=1)
+    controller = RuntimeModelController(
+        orchestrator,
+        mt2,
+        translator_factory=FakeTranslator,
+        watch_interval=60.0,
+        state_reader=lambda key: states[key],
+        retry_initial_delay=0.5,
+        retry_max_delay=0.5,
+        clock=lambda: now[0],
+    )
+    controller.start()
+    try:
+        # No file transition is required: installed + inactive is enough to
+        # trigger the first runtime retry.
+        controller.refresh_once()
+        assert mt2.calls.count("start") == 1
+        assert isinstance(orchestrator.translator, PassthroughTranslator)
+
+        # Backoff prevents a tight retry loop.
+        controller.refresh_once()
+        assert mt2.calls.count("start") == 1
+
+        now[0] += 0.5
+        controller.refresh_once()
+        assert mt2.calls.count("start") == 2
+        assert isinstance(orchestrator.translator, FakeTranslator)
+        assert orchestrator.statuses[-1] == ("Local Translation", "Hy-MT2: loaded")
     finally:
         controller.stop()
