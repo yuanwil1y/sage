@@ -69,35 +69,32 @@ class RegionSelectorDialog(QtWidgets.QDialog):
         qt_index = screens.index(self._screen) if self._screen in screens else 0
         primary = QtGui.QGuiApplication.primaryScreen()
         is_primary = self._screen == primary
-        device_idx = 0
-        output_idx = qt_index
 
         # Resolve the Qt screen to an actual DXcam device/output while the user
-        # is selecting it. The Qt index remains only a hint; physical size and
-        # primary status validate/remap across all adapters. Ambiguous mappings
-        # are rejected instead of silently capturing another monitor.
+        # is selecting it. Qt ordering is only a provisional hint here, never a
+        # persisted identity, so a new selection must have a unique physical
+        # match across all adapters. Ambiguity is safer to reject than capture
+        # a different same-resolution monitor.
         try:
             import dxcam
 
             outputs = parse_output_info(dxcam.output_info())
-            if outputs:
-                resolved = resolve_output(
-                    outputs,
-                    saved_device_idx=0,
-                    saved_output_idx=qt_index,
-                    expected_size=physical_size(
-                        (
-                            geometry.left(),
-                            geometry.top(),
-                            geometry.width(),
-                            geometry.height(),
-                        ),
-                        scale,
+            resolved = resolve_output(
+                outputs,
+                saved_device_idx=0,
+                saved_output_idx=qt_index,
+                expected_size=physical_size(
+                    (
+                        geometry.left(),
+                        geometry.top(),
+                        geometry.width(),
+                        geometry.height(),
                     ),
-                    primary=is_primary,
-                )
-                device_idx = resolved.device_idx
-                output_idx = resolved.output_idx
+                    scale,
+                ),
+                primary=is_primary,
+                prefer_saved=False,
+            )
         except ImportError as exc:
             raise RuntimeError("DXcam 未安装，无法确认聊天区域所在显示器") from exc
         except Exception as exc:
@@ -109,9 +106,9 @@ class RegionSelectorDialog(QtWidgets.QDialog):
         except Exception:
             pass
         return RoiConfig(
-            output_idx,
+            resolved.output_idx,
             *local_region,
-            device_idx=device_idx,
+            device_idx=resolved.device_idx,
             coordinate_space="output",
             screen_name=self._screen.name() or None,
             screen_serial=serial or None,
