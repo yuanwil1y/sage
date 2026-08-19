@@ -122,7 +122,12 @@ class ChatOcrWorker:
         self.on_status = on_status
         self.poll_hz = poll_hz
         self.min_score = min_score
-        self.capture: FrameCapture = capture or ScreenCapture(region.output_idx)
+        self.capture: FrameCapture = capture or ScreenCapture(
+            region.output_idx,
+            screen_geometry=region.screen_geometry,
+            device_pixel_ratio=region.device_pixel_ratio,
+            screen_primary=region.screen_primary,
+        )
         self.recognizer: FrameRecognizer = recognizer or OcrEngine(lang="japan")
         self.deduper = deduper or OcrDeduper(threshold=90.0)
         self.change_detector = FrameChangeDetector(threshold=change_threshold)

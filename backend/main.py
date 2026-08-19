@@ -14,7 +14,6 @@ import time
 
 from config.preferences import load_preferences
 from config.roi import load_roi_config
-from ipc import protocol
 from ipc.pipe_server import PipeServer
 from pipeline.orchestrator import TranslatorOrchestrator
 from runtime_models import PassthroughTranslator, RuntimeModelController
@@ -188,7 +187,8 @@ def run(use_ui: bool = False) -> None:
         log.info("headless 模式运行中（Ctrl+C 退出）")
         try:
             while True:
-                pipe.broadcast(protocol.heartbeat_message())
+                # PipeServer owns the heartbeat now, so stale clients are
+                # detected even when this loop is replaced by the GUI.
                 time.sleep(2.0)
         except KeyboardInterrupt:
             log.info("收到中断，正在停止……")

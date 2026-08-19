@@ -29,6 +29,13 @@ class RoiConfig:
     top: int
     right: int
     bottom: int
+    # Optional screen fingerprint. Old configs without these fields remain
+    # readable, but newly selected regions can be validated against DXcam.
+    screen_name: str | None = None
+    screen_serial: str | None = None
+    screen_geometry: tuple[int, int, int, int] | None = None
+    device_pixel_ratio: float | None = None
+    screen_primary: bool | None = None
 
     def __post_init__(self) -> None:
         if self.output_idx < 0:
@@ -38,19 +45,42 @@ class RoiConfig:
                 "ROI must have positive size: "
                 f"({self.left}, {self.top}, {self.right}, {self.bottom})"
             )
+        if self.screen_geometry is not None:
+            if len(self.screen_geometry) != 4:
+                raise ValueError("screen_geometry must contain four integers")
+            try:
+                geometry = tuple(int(value) for value in self.screen_geometry)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("screen_geometry must contain integers") from exc
+            if geometry[2] <= 0 or geometry[3] <= 0:
+                raise ValueError("screen_geometry must have positive size")
+            object.__setattr__(self, "screen_geometry", geometry)
+        if self.device_pixel_ratio is not None and self.device_pixel_ratio <= 0:
+            raise ValueError("device_pixel_ratio must be positive")
 
     @property
     def region(self) -> tuple[int, int, int, int]:
         return self.left, self.top, self.right, self.bottom
 
-    def to_dict(self) -> dict[str, int]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
             "output_idx": self.output_idx,
             "left": self.left,
             "top": self.top,
             "right": self.right,
             "bottom": self.bottom,
         }
+        if self.screen_name:
+            data["screen_name"] = self.screen_name
+        if self.screen_serial:
+            data["screen_serial"] = self.screen_serial
+        if self.screen_geometry is not None:
+            data["screen_geometry"] = list(self.screen_geometry)
+        if self.device_pixel_ratio is not None:
+            data["device_pixel_ratio"] = self.device_pixel_ratio
+        if self.screen_primary is not None:
+            data["screen_primary"] = self.screen_primary
+        return data
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "RoiConfig":
@@ -62,6 +92,33 @@ class RoiConfig:
             values = {key: int(data[key]) for key in keys}
         except (TypeError, ValueError) as exc:
             raise ValueError("ROI coordinates must be integers") from exc
+        screen_geometry = data.get("screen_geometry")
+        if screen_geometry is not None:
+            try:
+                screen_geometry = tuple(int(value) for value in screen_geometry)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("screen_geometry must contain integers") from exc
+        values.update(
+            {
+                "screen_name": str(data["screen_name"])
+                if data.get("screen_name")
+                else None,
+                "screen_serial": str(data["screen_serial"])
+                if data.get("screen_serial")
+                else None,
+                "screen_geometry": screen_geometry,
+                "device_pixel_ratio": (
+                    float(data["device_pixel_ratio"])
+                    if data.get("device_pixel_ratio") is not None
+                    else None
+                ),
+                "screen_primary": (
+                    bool(data["screen_primary"])
+                    if data.get("screen_primary") is not None
+                    else None
+                ),
+            }
+        )
         return cls(**values)
 
 

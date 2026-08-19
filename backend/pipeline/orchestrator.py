@@ -368,6 +368,36 @@ class TranslatorOrchestrator:
 
     # ---- 进程发现 + 音频捕获 ----
 
+    def _on_capture_failure(
+        self,
+        exit_code: int | None,
+        diagnostics: str,
+        attempt: int,
+    ) -> None:
+        """Expose helper failures without letting them kill the monitor."""
+        detail = diagnostics.splitlines()[0].strip() if diagnostics else "无附加日志"
+        self._report_status("Voice", f"音频捕获中断，正在恢复（第 {attempt} 次）")
+        log.warning(
+            "audio-capture 退出 code=%s，第 %d 次恢复：%s",
+            exit_code,
+            attempt,
+            detail[:240],
+        )
+
+    def _on_capture_before_restart(self, target_pid: int, attempt: int) -> None:
+        """Clear stream state before a replacement helper starts.
+
+        A process restart is a hard PCM boundary. Never let a partial stereo
+        frame, resampler history, or VAD recurrent state cross that boundary.
+        """
+        if self.audio_pipeline is not None:
+            self.audio_pipeline.reset()
+        log.info(
+            "audio-capture 即将恢复 target_pid=%d（第 %d 次），已重置音频管线",
+            target_pid,
+            attempt,
+        )
+
     def _start_capture(self, target_pid: int) -> None:
         """针对 VALORANT pid 启动/重建音频捕获。"""
         if not self.voice_enabled:
@@ -375,6 +405,16 @@ class TranslatorOrchestrator:
         if self._capture_factory is not None:
             cap = self._capture_factory
             cap.on_pcm = self.handle_pcm
+            # Tests and embedders may provide a reader-like object rather than
+            # the concrete AudioCaptureReader, so install callbacks softly.
+            for name, callback in (
+                ("on_failure", self._on_capture_failure),
+                ("on_before_restart", self._on_capture_before_restart),
+            ):
+                try:
+                    setattr(cap, name, callback)
+                except Exception:
+                    log.debug("无法设置 capture callback: %s", name, exc_info=True)
             try:
                 cap.start(target_pid)
             except FileNotFoundError as exc:
@@ -384,7 +424,11 @@ class TranslatorOrchestrator:
         if self._capture is None:
             from audio.capture_reader import AudioCaptureReader
 
-            self._capture = AudioCaptureReader(on_pcm=self.handle_pcm)
+            self._capture = AudioCaptureReader(
+                on_pcm=self.handle_pcm,
+                on_failure=self._on_capture_failure,
+                on_before_restart=self._on_capture_before_restart,
+            )
         try:
             self._capture.start(target_pid)
         except FileNotFoundError as exc:

@@ -40,14 +40,45 @@ class RegionSelectorDialog(QtWidgets.QDialog):
             return None
 
         geometry = self._screen.geometry()
-        scale = float(self._screen.devicePixelRatio())
-        left = round((geometry.left() + self._selection.left()) * scale)
-        top = round((geometry.top() + self._selection.top()) * scale)
-        right = round((geometry.left() + self._selection.right() + 1) * scale)
-        bottom = round((geometry.top() + self._selection.bottom() + 1) * scale)
+        # Qt keeps the virtual desktop origin in native desktop coordinates on
+        # Windows but reports each screen's size in device-independent pixels.
+        # Scale only the local selection; scaling the global origin breaks
+        # monitors placed left/above the primary display.
+        handle = self.windowHandle()
+        scale = float(
+            handle.devicePixelRatio()
+            if handle is not None
+            else self._screen.devicePixelRatio()
+        )
+        left = geometry.left() + round(self._selection.left() * scale)
+        top = geometry.top() + round(self._selection.top() * scale)
+        right = geometry.left() + round((self._selection.right() + 1) * scale)
+        bottom = geometry.top() + round((self._selection.bottom() + 1) * scale)
         screens = QtGui.QGuiApplication.screens()
         output_idx = screens.index(self._screen) if self._screen in screens else 0
-        return RoiConfig(output_idx, left, top, right, bottom)
+        primary = QtGui.QGuiApplication.primaryScreen()
+        serial = ""
+        try:
+            serial = self._screen.serialNumber() or ""
+        except Exception:
+            pass
+        return RoiConfig(
+            output_idx,
+            left,
+            top,
+            right,
+            bottom,
+            screen_name=self._screen.name() or None,
+            screen_serial=serial or None,
+            screen_geometry=(
+                geometry.left(),
+                geometry.top(),
+                geometry.width(),
+                geometry.height(),
+            ),
+            device_pixel_ratio=scale,
+            screen_primary=self._screen == primary,
+        )
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: ARG002
         painter = QtGui.QPainter(self)
