@@ -1,0 +1,29 @@
+name: Widget PR validation
+
+on:
+  pull_request:
+    paths:
+      - "gamebar-widget/**"
+      - ".github/workflows/widget-pr-validation.yml"
+
+jobs:
+  compile-widget:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+      - name: Build SageWidgetService
+        shell: pwsh
+        run: |
+          msbuild gamebar-widget\Service\SageWidgetService.csproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /m
+          if (-not (Test-Path "gamebar-widget/ServicePayload/SageWidgetService.exe")) {
+            throw "SageWidgetService.exe was not produced"
+          }
+      - name: Compile Game Bar widget
+        shell: pwsh
+        run: >-
+          msbuild gamebar-widget\ValorantTranslator.csproj
+          /restore /t:Rebuild /p:Configuration=Release /p:Platform=x64 /m
