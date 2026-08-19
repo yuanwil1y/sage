@@ -38,6 +38,7 @@ jobs:
           tests/test_transcriber.py
           tests/test_runtime_models.py
           tests/test_release_validation.py
+          tests/test_startup_options.py
       - name: Validate release metadata
         run: python release_validation.py
 
@@ -67,6 +68,7 @@ jobs:
           tests/test_vad.py
           tests/test_runtime_models.py
           tests/test_release_validation.py
+          tests/test_startup_options.py
       - name: Validate release metadata
         run: python release_validation.py
 
