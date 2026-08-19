@@ -44,6 +44,7 @@ class AudioCaptureReader:
         restart_stable_seconds: float = 30.0,
         stderr_tail_bytes: int = 16 * 1024,
         enforce_platform_support: bool | None = None,
+        supervisor_join_timeout: float = 4.0,
     ) -> None:
         self.exe_path = Path(exe_path) if exe_path else _DEFAULT_EXE
         self.on_pcm = on_pcm
@@ -53,6 +54,7 @@ class AudioCaptureReader:
         self.restart_max_delay = max(self.restart_initial_delay, float(restart_max_delay))
         self.restart_stable_seconds = max(0.0, float(restart_stable_seconds))
         self.stderr_tail_bytes = max(1024, int(stderr_tail_bytes))
+        self.supervisor_join_timeout = max(0.0, float(supervisor_join_timeout))
         if enforce_platform_support is None:
             enforce_platform_support = self.exe_path.name.lower() == "valorant_audio_capture.exe"
         self.enforce_platform_support = bool(enforce_platform_support)
@@ -60,6 +62,9 @@ class AudioCaptureReader:
         self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
+        # Every start() replaces this object instead of clearing/reusing it.
+        # Old supervisor generations retain their own permanently-cancelled
+        # event even if a later target starts before they fully unwind.
         self._stop_event = threading.Event()
         self._proc_lock = threading.Lock()
         self._stderr_lock = threading.Lock()
@@ -112,34 +117,46 @@ class AudioCaptureReader:
         """Start supervision for ``target_pid``; replacing any prior target."""
         self.assert_available()
         self.stop()
+
+        stop_event = threading.Event()
+        self._stop_event = stop_event
         self._target_pid = int(target_pid)
-        self._stop_event.clear()
-        self._reader_thread = threading.Thread(
+        thread = threading.Thread(
             target=self._supervise_loop,
-            args=(self._target_pid,),
+            args=(self._target_pid, stop_event),
             name="AudioCaptureSupervisor",
             daemon=True,
         )
-        self._reader_thread.start()
+        self._reader_thread = thread
+        thread.start()
 
     def stop(self) -> None:
-        """Stop the helper and supervisor without scheduling a restart."""
-        self._stop_event.set()
+        """Stop the current helper generation without enabling it to revive."""
+        stop_event = self._stop_event
+        stop_event.set()
         with self._proc_lock:
             proc = self._proc
         self._terminate_process(proc)
 
         thread = self._reader_thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=4.0)
+            thread.join(timeout=self.supervisor_join_timeout)
+            if thread.is_alive():
+                log.warning(
+                    "audio-capture supervisor 未在 %.1fs 内退出；旧 generation 保持取消状态",
+                    self.supervisor_join_timeout,
+                )
         stderr_thread = self._stderr_thread
         if stderr_thread is not None and stderr_thread is not threading.current_thread():
             stderr_thread.join(timeout=1.0)
 
         with self._proc_lock:
-            self._proc = None
-        self._reader_thread = None
-        self._stderr_thread = None
+            if self._proc is proc:
+                self._proc = None
+        if thread is None or not thread.is_alive():
+            self._reader_thread = None
+        if stderr_thread is None or not stderr_thread.is_alive():
+            self._stderr_thread = None
         self._target_pid = None
 
     @staticmethod
@@ -170,11 +187,15 @@ class AudioCaptureReader:
                 removed = self._stderr_chunks.popleft()
                 self._stderr_size -= len(removed)
 
-    def _drain_stderr(self, proc: subprocess.Popen) -> None:
+    def _drain_stderr(
+        self,
+        proc: subprocess.Popen,
+        stop_event: threading.Event,
+    ) -> None:
         if proc.stderr is None:
             return
         try:
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 chunk = proc.stderr.read(_STDERR_CHUNK)
                 if not chunk:
                     break
@@ -182,31 +203,52 @@ class AudioCaptureReader:
         except Exception:
             log.exception("读取 audio-capture stderr 失败")
 
-    def _launch_once(self, target_pid: int) -> subprocess.Popen:
+    def _launch_once(
+        self,
+        target_pid: int,
+        stop_event: threading.Event,
+    ) -> tuple[subprocess.Popen, threading.Thread | None]:
         cmd = self._build_command(target_pid)
         log.info("启动 audio-capture: %s", " ".join(cmd))
         self._clear_stderr()
         proc = self._popen(cmd)
+
+        # stop() can race with Popen. Never publish a process that belongs to a
+        # cancelled/stale supervisor generation as the current helper.
+        if stop_event.is_set() or self._stop_event is not stop_event:
+            self._terminate_process(proc)
+            return proc, None
+
         with self._proc_lock:
+            if stop_event.is_set() or self._stop_event is not stop_event:
+                self._terminate_process(proc)
+                return proc, None
             self._proc = proc
-        self._stderr_thread = threading.Thread(
+
+        stderr_thread = threading.Thread(
             target=self._drain_stderr,
-            args=(proc,),
+            args=(proc, stop_event),
             name="AudioCaptureStderr",
             daemon=True,
         )
-        self._stderr_thread.start()
-        return proc
+        if self._stop_event is stop_event:
+            self._stderr_thread = stderr_thread
+        stderr_thread.start()
+        return proc, stderr_thread
 
-    def _supervise_loop(self, target_pid: int) -> None:
+    def _supervise_loop(self, target_pid: int, stop_event: threading.Event) -> None:
         failure_count = 0
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             started_at = time.monotonic()
             proc: subprocess.Popen | None = None
+            stderr_thread: threading.Thread | None = None
             launch_error: Exception | None = None
             try:
-                proc = self._launch_once(target_pid)
-                self._read_loop(proc)
+                proc, stderr_thread = self._launch_once(target_pid, stop_event)
+                if stop_event.is_set():
+                    self._terminate_process(proc)
+                    break
+                self._read_loop(proc, stop_event)
             except Exception as exc:
                 launch_error = exc
                 log.exception("audio-capture 启动/读取失败")
@@ -216,7 +258,6 @@ class AudioCaptureReader:
                     exit_code = proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     exit_code = proc.poll()
-                stderr_thread = self._stderr_thread
                 if (
                     stderr_thread is not None
                     and stderr_thread is not threading.current_thread()
@@ -225,7 +266,7 @@ class AudioCaptureReader:
             else:
                 exit_code = None
 
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 break
 
             runtime = time.monotonic() - started_at
@@ -252,7 +293,7 @@ class AudioCaptureReader:
                 self.restart_max_delay,
                 self.restart_initial_delay * (2 ** max(0, failure_count - 1)),
             )
-            if self._stop_event.wait(delay):
+            if stop_event.wait(delay):
                 break
 
             try:
@@ -264,17 +305,27 @@ class AudioCaptureReader:
                 log.exception("audio-capture restart/stream-reset 回调失败")
 
         with self._proc_lock:
-            if self._proc is not None and self._proc.poll() is not None:
+            if (
+                self._stop_event is stop_event
+                and self._proc is not None
+                and self._proc.poll() is not None
+            ):
                 self._proc = None
         log.info("audio-capture supervisor 结束 target_pid=%s", target_pid)
 
-    def _read_loop(self, proc: subprocess.Popen | None = None) -> None:
+    def _read_loop(
+        self,
+        proc: subprocess.Popen | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         """Drain PCM from one helper process until EOF or intentional stop."""
         if proc is None:
             with self._proc_lock:
                 proc = self._proc
+        if stop_event is None:
+            stop_event = self._stop_event
         assert proc is not None and proc.stdout is not None
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             chunk = proc.stdout.read(_CHUNK)
             if not chunk:
                 break
