@@ -66,6 +66,7 @@ jobs:
           tests/test_audio_normalize_resample.py
           tests/test_vad.py
           tests/test_runtime_models.py
+          tests/test_pipe_server.py
           tests/test_release_validation.py
       - name: Validate release metadata
         run: python release_validation.py
