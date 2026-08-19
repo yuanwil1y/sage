@@ -8,11 +8,6 @@
 - min_silence_duration_ms: 800   （连续静音约 800ms 判定整句结束）
 - speech_pad_ms:           300   （语音前后各保留约 300ms 上下文）
 - max_utterance_ms:        20000 （超长强制切分）
-
-状态机：
-    silence ──speech──▶ speech（预滚 speech_pad 帧加入句首）
-    speech  ──silence≥800ms──▶ 句结束（保留 speech_pad 尾部静音）
-    speech  ──超 20s──▶ 强制切分
 """
 
 from __future__ import annotations
@@ -27,8 +22,6 @@ from audio.onnx_vad import OnnxVadModel
 log = logging.getLogger(__name__)
 
 FRAME_SIZE = 512  # 16 kHz 下 = 32 ms/帧
-
-# Silero VAD 内部以 512-sample 窗口处理，模型输入恰好一帧
 FRAME_MS = FRAME_SIZE * 1000 / 16000  # 32 ms
 
 
@@ -61,13 +54,15 @@ class UtteranceSegmenter:
         self.max_frames = max(1, max_utterance_ms // int(FRAME_MS))
         self.reset()
 
-    # ---- 状态 ----
-
     def reset(self) -> None:
         self._in_speech = False
-        self._pre_roll: list[np.ndarray] = []  # 语音开始前保留的静音帧
-        self._buf: list[np.ndarray] = []       # 当前 utterance 的音频帧
+        self._pre_roll: list[np.ndarray] = []
+        self._buf: list[np.ndarray] = []
         self._silence_frames = 0
+        self._remainder = np.zeros(0, dtype=np.float32)
+        reset_states = getattr(self.model, "reset_states", None)
+        if callable(reset_states):
+            reset_states()
 
     def configure(
         self,
@@ -92,14 +87,19 @@ class UtteranceSegmenter:
     def in_speech(self) -> bool:
         return self._in_speech
 
-    # ---- 主入口 ----
-
     def process(self, audio_16k: np.ndarray) -> list[np.ndarray]:
-        """喂入一段 16k mono float32 音频，返回完整切分出的 utterances。"""
+        """Feed arbitrary-sized 16 kHz chunks without dropping frame remainders."""
+        audio = np.asarray(audio_16k, dtype=np.float32).reshape(-1)
+        if self._remainder.size:
+            audio = np.concatenate([self._remainder, audio])
+
+        n_frames = audio.size // FRAME_SIZE
+        usable = n_frames * FRAME_SIZE
+        self._remainder = audio[usable:].copy()
+
         utterances: list[np.ndarray] = []
-        n_frames = audio_16k.size // FRAME_SIZE
         for i in range(n_frames):
-            frame = audio_16k[i * FRAME_SIZE : (i + 1) * FRAME_SIZE]
+            frame = audio[i * FRAME_SIZE : (i + 1) * FRAME_SIZE]
             is_speech = self._is_speech(frame)
             done = self._advance(frame, is_speech)
             if done is not None:
@@ -107,14 +107,20 @@ class UtteranceSegmenter:
         return utterances
 
     def finish(self) -> list[np.ndarray]:
-        """音频流结束：把未完结的语音段按整句发出（用于进程退出/捕获重启）。"""
+        """Flush a partial stream, including a final sub-512-sample speech tail."""
         utterances: list[np.ndarray] = []
-        if self._in_speech and len(self._buf) > self.min_silence_frames:
+        # A sub-frame tail cannot be classified by Silero. Preserve it only when
+        # the last classified VAD frame was speech. If we are already inside a
+        # trailing-silence run, treating unknown tail samples as speech would
+        # re-introduce silence that _emit() is intentionally trimming.
+        if self._remainder.size and self._in_speech and self._silence_frames == 0:
+            self._buf.append(self._remainder.copy())
+        self._remainder = np.zeros(0, dtype=np.float32)
+
+        if self._in_speech and self._buf:
             utterances.append(self._emit())
         self.reset()
         return utterances
-
-    # ---- 内部 ----
 
     def _is_speech(self, frame: np.ndarray) -> bool:
         prob = float(self.model(frame[None, :], 16000))
@@ -123,18 +129,15 @@ class UtteranceSegmenter:
     def _advance(self, frame: np.ndarray, is_speech: bool) -> np.ndarray | None:
         if not self._in_speech:
             if not is_speech:
-                # 静音态：滚动保留 pre-roll
                 self._pre_roll.append(frame)
                 if len(self._pre_roll) > self.pad_frames:
                     self._pre_roll.pop(0)
                 return None
-            # 语音开始：之前保留的 pre-roll 静音 + 当前语音帧
             self._in_speech = True
             self._buf = list(self._pre_roll) + [frame]
             self._silence_frames = 0
             return None
 
-        # 语音态
         self._buf.append(frame)
         if is_speech:
             self._silence_frames = 0
@@ -149,14 +152,12 @@ class UtteranceSegmenter:
         return None
 
     def _emit(self) -> np.ndarray:
-        """切出当前 utterance：截掉尾部多余静音，保留 speech_pad 尾部。"""
         if self._silence_frames > self.pad_frames:
             keep = len(self._buf) - self._silence_frames + self.pad_frames
             audio = np.concatenate(self._buf[:keep])
         else:
             audio = np.concatenate(self._buf)
 
-        # 回填 pre-roll（句尾保留的静音可能属于下一句）
         if self.pad_frames > 0:
             tail = self._buf[-self.pad_frames :]
             self._pre_roll = list(tail)

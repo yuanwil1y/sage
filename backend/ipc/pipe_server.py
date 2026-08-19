@@ -23,15 +23,18 @@ from typing import Any, Optional
 import pywintypes
 import win32api
 import win32con
+import win32event
 import win32file
 import win32pipe
 import win32security
+import winerror
 
 log = logging.getLogger(__name__)
 
 PIPE_NAME = r"\\.\pipe\LOCAL\ValorantTranslator"
 PIPE_BUFFER_SIZE = 65536
-PIPE_TIMEOUT_MS = 2000  # ConnectNamedPipe 单次等待，便于干净退出
+PIPE_TIMEOUT_MS = 2000  # CreateNamedPipe 的系统超时；连接本身使用 overlapped
+HEARTBEAT_INTERVAL_SECONDS = 2.0
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "package_identity.json"
 
@@ -120,6 +123,8 @@ class PipeServer(threading.Thread):
     def stop(self, timeout: float = 3.0) -> None:
         self._stop_event.set()
         self.join(timeout=timeout)
+        if self.is_alive():
+            log.warning("PipeServer 未能在 %.1f 秒内退出", timeout)
 
     # ---- 线程主体 ----
 
@@ -130,7 +135,7 @@ class PipeServer(threading.Thread):
             try:
                 handle = win32pipe.CreateNamedPipe(
                     self.pipe_name,
-                    win32pipe.PIPE_ACCESS_OUTBOUND,
+                    win32pipe.PIPE_ACCESS_OUTBOUND | win32file.FILE_FLAG_OVERLAPPED,
                     win32pipe.PIPE_TYPE_MESSAGE
                     | win32pipe.PIPE_READMODE_MESSAGE
                     | win32pipe.PIPE_WAIT,
@@ -146,8 +151,8 @@ class PipeServer(threading.Thread):
                 continue
 
             try:
-                # ConnectNamedPipe 返回 0 可能是 ERROR_PIPE_CONNECTED（客户端已抢先连上）
-                win32pipe.ConnectNamedPipe(handle, None)
+                if not self._connect(handle):
+                    continue
                 log.info("Widget 已连接")
                 self._client_connected.set()
                 self._serve(handle)
@@ -163,13 +168,72 @@ class PipeServer(threading.Thread):
 
         log.info("PipeServer 已停止")
 
+    def _connect(self, handle: Any) -> bool:
+        """等待客户端连接，同时允许 stop() 在 100ms 内打断等待。
+
+        ``ConnectNamedPipe(handle, None)`` 是同步调用。旧实现会让服务线程
+        卡在这里，GUI 退出或后台停止时最多要等系统超时。使用 overlapped
+        连接后，线程只等待一个事件，并定期检查自己的停止事件；取消操作
+        也发生在发起 I/O 的同一线程，兼容 pywin32 只暴露 CancelIo 的情况。
+        """
+        overlapped = pywintypes.OVERLAPPED()
+        overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+        connected = False
+        try:
+            try:
+                win32pipe.ConnectNamedPipe(handle, overlapped)
+                # pywin32 may return None both for an immediate completion and
+                # for an overlapped request that is still pending. Inspect the
+                # event instead of assuming the former.
+                connected = (
+                    win32event.WaitForSingleObject(overlapped.hEvent, 0)
+                    == win32event.WAIT_OBJECT_0
+                )
+            except pywintypes.error as exc:
+                code = getattr(exc, "winerror", None)
+                if code is None and exc.args:
+                    code = exc.args[0]
+                if code == winerror.ERROR_PIPE_CONNECTED:
+                    connected = True
+                elif code != winerror.ERROR_IO_PENDING:
+                    raise
+
+            while not connected and not self._stop_event.is_set():
+                result = win32event.WaitForSingleObject(overlapped.hEvent, 100)
+                if result == win32event.WAIT_OBJECT_0:
+                    connected = True
+
+            if self._stop_event.is_set() and not connected:
+                try:
+                    # CancelIo only cancels requests issued by this thread,
+                    # which is exactly where ConnectNamedPipe was issued.
+                    win32file.CancelIo(handle)
+                except pywintypes.error:
+                    pass
+                win32event.WaitForSingleObject(overlapped.hEvent, 1000)
+                return False
+            return connected
+        finally:
+            try:
+                win32file.CloseHandle(overlapped.hEvent)
+            except Exception:
+                pass
+
     def _serve(self, handle: Any) -> None:
         """连接存续期间，持续把队列里的字节写入 pipe。"""
+        from ipc import protocol
+
+        next_heartbeat = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS
         while not self._stop_event.is_set():
+            remaining = max(0.0, next_heartbeat - time.monotonic())
             try:
-                payload = self._queue.get(timeout=0.2)
+                payload = self._queue.get(timeout=min(0.2, remaining))
             except queue.Empty:
-                continue
+                if time.monotonic() >= next_heartbeat:
+                    payload = protocol.encode(protocol.heartbeat_message())
+                    next_heartbeat = time.monotonic() + HEARTBEAT_INTERVAL_SECONDS
+                else:
+                    continue
             try:
                 win32file.WriteFile(handle, payload)
             except pywintypes.error as exc:

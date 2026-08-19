@@ -93,6 +93,18 @@ def test_broadcast_before_client_is_dropped() -> None:
         assert not server.client_connected
     finally:
         server.stop()
+        assert not server.is_alive()
+
+
+def test_stop_without_client_is_cancellable() -> None:
+    """没有客户端时，stop 不应卡在 ConnectNamedPipe。"""
+    server = PipeServer(pipe_name=_test_pipe_name())
+    server.start()
+    try:
+        time.sleep(0.2)
+    finally:
+        server.stop(timeout=1.5)
+    assert not server.is_alive()
 
 
 def test_client_reconnect_after_disconnect() -> None:
@@ -103,9 +115,8 @@ def test_client_reconnect_after_disconnect() -> None:
     try:
         client1 = _connect_client(pipe_name)
         client1.Close()
-        # An outbound message lets the server observe the closed read handle
-        # and recreate the pipe instance for the next client.
-        server.broadcast(protocol.heartbeat_message())
+        # The server sends its own periodic heartbeat. This must notice a
+        # stale client even when the Python headless main is not running.
         deadline = time.monotonic() + 3.0
         while server.client_connected and time.monotonic() < deadline:
             time.sleep(0.02)

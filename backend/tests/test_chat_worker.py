@@ -74,6 +74,41 @@ def test_chat_worker_assembles_and_deduplicates_lines():
     assert recognizer.calls == 2
 
 
+def test_live_poll_hz_is_recomputed_each_iteration():
+    recognizer = FakeRecognizer()
+    capture = FakeCapture()
+    worker = ChatOcrWorker(
+        RoiConfig(0, 10, 20, 110, 120),
+        on_line=lambda _: None,
+        capture=capture,
+        recognizer=recognizer,
+        poll_hz=4.0,
+    )
+
+    class ControlledStopEvent:
+        def __init__(self):
+            self.waits: list[float] = []
+            self.count = 0
+
+        def is_set(self):
+            return self.count >= 2
+
+        def wait(self, timeout):
+            self.waits.append(float(timeout))
+            self.count += 1
+            if self.count == 1:
+                worker.configure(poll_hz=20.0)
+            return False
+
+    stop_event = ControlledStopEvent()
+    worker._stop_event = stop_event  # type: ignore[assignment]
+    worker._run()
+
+    assert len(stop_event.waits) == 2
+    assert stop_event.waits[0] > 0.15  # ~250 ms at 4 Hz
+    assert stop_event.waits[1] < 0.10  # ~50 ms after live update to 20 Hz
+
+
 def test_chat_worker_stops_after_permanent_ocr_initialization_failure(caplog):
     recognizer = FailingRecognizer()
     capture = FakeCapture()

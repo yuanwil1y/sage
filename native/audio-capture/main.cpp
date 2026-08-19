@@ -12,11 +12,13 @@
 
 #include <windows.h>
 #include <wrl/client.h>
+#include <wrl/implements.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <initguid.h>
 
 #include <cstdio>
+#include <cstdarg>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -73,54 +75,49 @@ static void log_msg(const char* fmt, ...) {
 //===========================================================================
 
 class CActivateAudioInterfaceCompletionHandler final
-    : public IActivateAudioInterfaceCompletionHandler,
-      public IAgileObject {
+    : public Microsoft::WRL::RuntimeClass<
+          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+          Microsoft::WRL::FtmBase,
+          IActivateAudioInterfaceCompletionHandler> {
 public:
     CActivateAudioInterfaceCompletionHandler() = default;
 
     // IActivateAudioInterfaceCompletionHandler
     STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation* operation) override {
-        HRESULT hr = S_OK;
+        HRESULT activationResult = E_UNEXPECTED;
+        HRESULT getResult = E_POINTER;
         IUnknown* punk = nullptr;
-        hr = operation->GetActivateResult(&hr, &punk);
-        if (SUCCEEDED(hr) && punk != nullptr) {
-            hr = punk->QueryInterface(IID_PPV_ARGS(&m_audioClient));
+        if (operation != nullptr) {
+            // These are two different HRESULTs: GetActivateResult reports
+            // whether the result could be read, while activationResult is
+            // the actual result of activating the audio interface.
+            getResult = operation->GetActivateResult(&activationResult, &punk);
+        }
+        m_activationResult = FAILED(getResult) ? getResult : activationResult;
+        if (SUCCEEDED(m_activationResult) && punk != nullptr) {
+            HRESULT queryResult = punk->QueryInterface(IID_PPV_ARGS(&m_audioClient));
+            if (FAILED(queryResult)) m_activationResult = queryResult;
+        } else if (SUCCEEDED(m_activationResult)) {
+            m_activationResult = E_NOINTERFACE;
+        }
+        if (punk != nullptr) {
             punk->Release();
         }
-        SetEvent(m_completedEvent);
-        return hr;
+        ::SetEvent(m_completedEvent);
+        // The async operation itself completed successfully; callers read the
+        // actual activation HRESULT from m_activationResult. Returning a
+        // failure here can make the COM completion machinery treat a handled
+        // activation error as a callback failure.
+        return S_OK;
     }
 
-    // IUnknown
-    STDMETHOD_(ULONG, AddRef)() override {
-        return InterlockedIncrement(&m_refCount);
-    }
-    STDMETHOD_(ULONG, Release)() override {
-        ULONG v = InterlockedDecrement(&m_refCount);
-        if (v == 0) {
-            delete this;
-        }
-        return v;
-    }
-    STDMETHOD(QueryInterface)(REFIID riid, void** ppv) override {
-        if (ppv == nullptr) return E_POINTER;
-        if (riid == IID_IUnknown ||
-            riid == __uuidof(IActivateAudioInterfaceCompletionHandler) ||
-            riid == __uuidof(IAgileObject)) {
-            AddRef();
-            *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-
-    void SetEvent(HANDLE ev) { m_completedEvent = ev; }
+    void SetCompletionEvent(HANDLE ev) { m_completedEvent = ev; }
     IAudioClient* GetAudioClient() { return m_audioClient.Get(); }
+    HRESULT ActivationResult() const { return m_activationResult; }
 
 private:
-    ULONG m_refCount = 1;
     HANDLE m_completedEvent = nullptr;
+    HRESULT m_activationResult = E_UNEXPECTED;
     ComPtr<IAudioClient> m_audioClient;
 };
 
@@ -128,20 +125,18 @@ private:
 // PCM 输出
 //===========================================================================
 
-static void output_float32_to_pcm16(const float* data, uint32_t frames) {
-    const size_t sample_count = static_cast<size_t>(frames) * 2;  // stereo
-    std::vector<int16_t> pcm(sample_count);
-    for (size_t i = 0; i < sample_count; ++i) {
-        float v = data[i];
-        if (v > 1.0f) v = 1.0f;
-        if (v < -1.0f) v = -1.0f;
-        pcm[i] = static_cast<int16_t>(v * 32767.0f);
+static void output_pcm16(const BYTE* data, uint32_t frames, DWORD flags) {
+    const size_t bytes = static_cast<size_t>(frames) * 2 * sizeof(int16_t);  // stereo
+    std::vector<uint8_t> silence;
+    if (data == nullptr || (flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+        // SILENT still advances the audio clock. Emit an equivalent amount of
+        // zero PCM so the downstream resampler/VAD does not see a time jump.
+        silence.assign(bytes, 0);
+        data = silence.data();
     }
-    const size_t bytes = pcm.size() * sizeof(int16_t);
-    const uint8_t* out = reinterpret_cast<const uint8_t*>(pcm.data());
     size_t written = 0;
     while (written < bytes) {
-        size_t n = fwrite(out + written, 1, bytes - written, stdout);
+        size_t n = fwrite(data + written, 1, bytes - written, stdout);
         if (n == 0) break;
         written += n;
     }
@@ -177,11 +172,18 @@ static void pump_audio(IAudioClient* audio_client) {
             break;
         }
 
-        if (frames > 0 && data != nullptr && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-            output_float32_to_pcm16(reinterpret_cast<const float*>(data), frames);
+        if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+            log_msg("WASAPI 报告 DATA_DISCONTINUITY");
+        }
+        if (frames > 0) {
+            output_pcm16(data, frames, flags);
         }
 
-        capture->ReleaseBuffer(frames);
+        hr = capture->ReleaseBuffer(frames);
+        if (FAILED(hr)) {
+            log_msg("ReleaseBuffer 失败: 0x%08x", hr);
+            break;
+        }
     }
 }
 
@@ -224,12 +226,19 @@ int wmain(int argc, wchar_t** argv) {
     propvar.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
 
     HANDLE completed = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    auto* handler = new (std::nothrow) CActivateAudioInterfaceCompletionHandler();
-    if (handler == nullptr) {
-        log_msg("内存分配失败");
+    if (completed == nullptr) {
+        log_msg("创建激活完成事件失败: 0x%08x", GetLastError());
         return 1;
     }
-    handler->SetEvent(completed);
+    ComPtr<CActivateAudioInterfaceCompletionHandler> handler;
+    hr = Microsoft::WRL::MakeAndInitialize<CActivateAudioInterfaceCompletionHandler>(
+        &handler);
+    if (FAILED(hr)) {
+        log_msg("创建激活回调失败: 0x%08x", hr);
+        CloseHandle(completed);
+        return 1;
+    }
+    handler->SetCompletionEvent(completed);
 
     ComPtr<IActivateAudioInterfaceAsyncOperation> op;
     log_msg("激活进程 loopback，目标 PID=%lu", target_pid);
@@ -237,14 +246,26 @@ int wmain(int argc, wchar_t** argv) {
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         __uuidof(IAudioClient),
         &propvar,
-        handler,
+        handler.Get(),
         &op);
 
     if (SUCCEEDED(hr)) {
-        WaitForSingleObject(completed, INFINITE);
+        DWORD wait_result = WaitForSingleObject(completed, 10000);
+        if (wait_result != WAIT_OBJECT_0) {
+            log_msg("等待音频接口激活回调超时: 0x%08x", wait_result);
+            CloseHandle(completed);
+            return 1;
+        }
     } else {
         log_msg("ActivateAudioInterfaceAsync 失败: 0x%08x", hr);
-        handler->Release();
+        CloseHandle(completed);
+        return 1;
+    }
+
+    HRESULT activation_result = handler->ActivationResult();
+    if (FAILED(activation_result)) {
+        log_msg("ActivateAudioInterfaceAsync 完成但激活失败: 0x%08x", activation_result);
+        CloseHandle(completed);
         return 1;
     }
 
@@ -252,33 +273,41 @@ int wmain(int argc, wchar_t** argv) {
     if (handler->GetAudioClient()) {
         client = handler->GetAudioClient();
     }
-    handler->Release();
+    handler.Reset();
+    CloseHandle(completed);
 
     if (!client) {
         log_msg("获取 IAudioClient 失败");
         return 1;
     }
 
-    // 混合格式：44.1kHz float32 stereo
+    // 请求稳定的 16-bit PCM；AUTOCONVERTPCM 允许系统把设备混合格式
+    // 转换到这个协议格式，避免把 float/声道布局差异传给 Python。
     WAVEFORMATEX mix_format{};
-    mix_format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+    mix_format.wFormatTag = WAVE_FORMAT_PCM;
     mix_format.nChannels = 2;
     mix_format.nSamplesPerSec = 44100;
-    mix_format.wBitsPerSample = 32;
+    mix_format.wBitsPerSample = 16;
     mix_format.nBlockAlign = (mix_format.nChannels * mix_format.wBitsPerSample) / 8;
     mix_format.nAvgBytesPerSec = mix_format.nSamplesPerSec * mix_format.nBlockAlign;
     mix_format.cbSize = 0;
 
     hr = client->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
         0, 0, &mix_format, nullptr);
     if (FAILED(hr)) {
         log_msg("Initialize(loopback) 失败: 0x%08x", hr);
         return 1;
     }
 
-    client->Start();
+    hr = client->Start();
+    if (FAILED(hr)) {
+        log_msg("Start(loopback) 失败: 0x%08x", hr);
+        return 1;
+    }
     log_msg("开始捕获，输出 PCM s16le 44.1kHz stereo...");
     pump_audio(client.Get());
     client->Stop();

@@ -147,6 +147,10 @@ namespace SageWidgetService
         private const int MaximumEvents = 256;
         private readonly object _gate = new object();
         private readonly List<SubtitleEvent> _events = new List<SubtitleEvent>();
+        // The cursor is only meaningful inside one service process. A fresh
+        // session lets the widget discard its old cursor after a service
+        // restart instead of waiting forever for ids that can never arrive.
+        public string Session { get; } = Guid.NewGuid().ToString("N");
         private long _cursor;
 
         public void Publish(string json)
@@ -251,7 +255,8 @@ namespace SageWidgetService
                     int waitMs = (int)ReadLongQuery(target, "wait_ms", 8000);
                     List<SubtitleEvent> events = _broker.Poll(after, waitMs, out long cursor);
                     var body = new StringBuilder();
-                    body.Append("{\"cursor\":").Append(cursor).Append(",\"events\":[");
+                    body.Append("{\"session\":\"").Append(_broker.Session)
+                        .Append("\",\"cursor\":").Append(cursor).Append(",\"events\":[");
                     for (int i = 0; i < events.Count; i++)
                     {
                         if (i > 0) body.Append(',');

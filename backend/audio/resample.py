@@ -21,12 +21,18 @@ class StreamResampler:
         output_rate: int = CANONICAL_RATE,
         quality: str = "HQ",
     ) -> None:
-        self._resampler = soxr.ResampleStream(
-            input_rate,
-            output_rate,
+        self._input_rate = input_rate
+        self._output_rate = output_rate
+        self._quality = quality
+        self._resampler = self._create_resampler()
+
+    def _create_resampler(self) -> soxr.ResampleStream:
+        return soxr.ResampleStream(
+            self._input_rate,
+            self._output_rate,
             1,
             dtype="float32",
-            quality=quality,
+            quality=self._quality,
         )
 
     def process(self, audio_44k: np.ndarray) -> np.ndarray:
@@ -34,3 +40,16 @@ class StreamResampler:
         if audio_44k.size == 0:
             return np.zeros(0, dtype=np.float32)
         return self._resampler.resample_chunk(audio_44k)
+
+    def finish(self) -> np.ndarray:
+        """Flush the current soxr stream and prepare a fresh stream."""
+        tail = self._resampler.resample_chunk(
+            np.zeros(0, dtype=np.float32),
+            last=True,
+        )
+        self.reset()
+        return np.asarray(tail, dtype=np.float32)
+
+    def reset(self) -> None:
+        """Discard pending resampler state and start a fresh stream."""
+        self._resampler = self._create_resampler()

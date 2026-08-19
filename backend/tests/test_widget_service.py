@@ -82,6 +82,7 @@ def test_named_pipe_to_http_event_chain() -> None:
         )
         response.raise_for_status()
         batch = response.json()
+        assert isinstance(batch["session"], str) and batch["session"]
         assert batch["cursor"] >= 1
         assert batch["events"][-1]["payload"] == expected
     finally:

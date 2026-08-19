@@ -9,7 +9,7 @@ import logging
 
 import numpy as np
 
-from audio.normalize import pcm_to_mono_float32
+from audio.normalize import StreamingPcmNormalizer
 from audio.resample import StreamResampler
 from audio.vad import UtteranceSegmenter
 
@@ -26,6 +26,7 @@ class AudioPipeline:
         vad_threshold: float = 0.50,
         min_silence_ms: int = 800,
     ) -> None:
+        self._normalizer = StreamingPcmNormalizer()
         self._resampler = StreamResampler()
         self._segmenter = segmenter or UtteranceSegmenter(
             threshold=vad_threshold,
@@ -45,10 +46,35 @@ class AudioPipeline:
         )
 
     def feed_pcm(self, pcm_bytes: bytes) -> list[np.ndarray]:
-        """输入 PCM s16le stereo 44.1k 字节，输出本批新完成的 utterances。"""
-        mono_44k = pcm_to_mono_float32(pcm_bytes)
+        """Feed PCM bytes; ``b''`` is an internal capture-stream boundary marker.
+
+        The supervised native helper emits this marker immediately before a
+        replacement helper starts.  Resetting here prevents PCM byte carry,
+        soxr state, VAD pre-roll, and recurrent Silero state from leaking
+        across two different helper processes.
+        """
+        if not pcm_bytes:
+            self.reset()
+            return []
+        mono_44k = self._normalizer.feed(pcm_bytes)
         audio_16k = self._resampler.process(mono_44k)
         return self._segmenter.process(audio_16k)
 
     def finish(self) -> list[np.ndarray]:
-        return self._segmenter.finish()
+        """Flush all stream stages and leave the pipeline ready for a new capture."""
+        utterances: list[np.ndarray] = []
+        tail_16k = self._resampler.finish()
+        if tail_16k.size:
+            utterances.extend(self._segmenter.process(tail_16k))
+        utterances.extend(self._segmenter.finish())
+
+        dropped = self._normalizer.finish()
+        if dropped:
+            log.warning("音频流结束时丢弃 %d 个不完整 PCM 帧字节", dropped)
+        return utterances
+
+    def reset(self) -> None:
+        """Discard all pending stream state without emitting a partial utterance."""
+        self._normalizer.reset()
+        self._resampler.reset()
+        self._segmenter.reset()

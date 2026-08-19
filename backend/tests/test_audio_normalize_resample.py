@@ -2,7 +2,8 @@
 
 import numpy as np
 
-from audio.normalize import pcm_to_mono_float32
+from audio.normalize import StreamingPcmNormalizer, pcm_to_mono_float32
+from audio.pipeline import AudioPipeline
 from audio.resample import CANONICAL_RATE, INPUT_RATE, StreamResampler
 
 
@@ -14,19 +15,47 @@ def _stereo_s16le(left: np.ndarray, right: np.ndarray) -> bytes:
 
 
 def test_pcm_to_mono_float32() -> None:
-    n = 4410  # 0.1s @44.1k
+    n = 4410
     left = np.full(n, 0.5, dtype=np.float64)
     right = np.full(n, -0.5, dtype=np.float64)
     mono = pcm_to_mono_float32(_stereo_s16le(left, right))
     assert mono.dtype == np.float32
     assert mono.shape == (n,)
-    assert np.allclose(mono, 0.0, atol=1e-3)  # (0.5 + -0.5) / 2
+    assert np.allclose(mono, 0.0, atol=1e-3)
 
 
-def test_pcm_trailing_partial_frame_is_dropped() -> None:
+def test_pcm_trailing_partial_frame_is_dropped_by_stateless_helper() -> None:
     data = _stereo_s16le(np.array([0.1, 0.2]), np.array([0.1, 0.2])) + b"\x00\x01"
     mono = pcm_to_mono_float32(data)
     assert mono.shape == (2,)
+
+
+def test_streaming_pcm_preserves_random_chunk_boundaries() -> None:
+    left = np.linspace(-0.9, 0.9, 2000, dtype=np.float64)
+    right = np.linspace(0.8, -0.8, 2000, dtype=np.float64)
+    data = _stereo_s16le(left, right)
+    expected = pcm_to_mono_float32(data)
+
+    rng = np.random.default_rng(20260819)
+    normalizer = StreamingPcmNormalizer()
+    chunks: list[np.ndarray] = []
+    offset = 0
+    while offset < len(data):
+        size = int(rng.integers(1, 65))
+        chunks.append(normalizer.feed(data[offset : offset + size]))
+        offset += size
+
+    assert normalizer.finish() == 0
+    actual = np.concatenate([chunk for chunk in chunks if chunk.size])
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_streaming_pcm_reports_incomplete_final_frame() -> None:
+    normalizer = StreamingPcmNormalizer()
+    assert normalizer.feed(b"\x01\x02\x03").size == 0
+    assert normalizer.pending_bytes == 3
+    assert normalizer.finish() == 3
+    assert normalizer.pending_bytes == 0
 
 
 def test_pcm_empty_input() -> None:
@@ -41,12 +70,10 @@ def test_resampler_rate_and_duration() -> None:
 
     out = resampler.process(x)
     assert out.dtype == np.float32
-    # soxr 流式 warm-up 会使输出采样略少（约 2~3%），故容忍 4%
     assert abs(out.size - CANONICAL_RATE) <= CANONICAL_RATE * 0.04
 
 
 def test_resampler_is_streaming_stateful() -> None:
-    """分片输入与整体输入的输出时长应一致（状态在内部保留）。"""
     r1, r2 = StreamResampler(), StreamResampler()
     x = (np.sin(np.arange(44100, dtype=np.float32) * 0.01) * 0.5).astype(np.float32)
 
@@ -54,4 +81,48 @@ def test_resampler_is_streaming_stateful() -> None:
     parts = np.concatenate(
         [r2.process(x[:10000]), r2.process(x[10000:30000]), r2.process(x[30000:])]
     )
-    assert abs(whole.size - parts.size) <= 2  # 允许边界处 ±1 帧差异
+    assert abs(whole.size - parts.size) <= 2
+
+
+def test_resampler_finish_flushes_tail_and_resets_stream() -> None:
+    x = (np.sin(np.arange(44100, dtype=np.float32) * 0.01) * 0.5).astype(np.float32)
+    resampler = StreamResampler()
+
+    first = np.concatenate([resampler.process(x), resampler.finish()])
+    second = np.concatenate([resampler.process(x), resampler.finish()])
+
+    assert abs(first.size - CANONICAL_RATE) <= 2
+    np.testing.assert_array_equal(second, first)
+
+
+class _ResetProbe:
+    def __init__(self) -> None:
+        self.reset_count = 0
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+
+class _SegmenterResetProbe(_ResetProbe):
+    def configure(self, **kwargs) -> None:
+        pass
+
+    def process(self, audio):
+        return []
+
+    def finish(self):
+        return []
+
+
+def test_empty_pcm_marker_resets_every_stream_stage() -> None:
+    segmenter = _SegmenterResetProbe()
+    pipeline = AudioPipeline(segmenter=segmenter)
+    normalizer = _ResetProbe()
+    resampler = _ResetProbe()
+    pipeline._normalizer = normalizer
+    pipeline._resampler = resampler
+
+    assert pipeline.feed_pcm(b"") == []
+    assert normalizer.reset_count == 1
+    assert resampler.reset_count == 1
+    assert segmenter.reset_count == 1

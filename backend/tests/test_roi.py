@@ -16,6 +16,24 @@ def test_roi_roundtrip(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8")) == config.to_dict()
 
 
+def test_roi_roundtrip_preserves_screen_fingerprint(tmp_path):
+    config = RoiConfig(
+        output_idx=0,
+        left=100,
+        top=200,
+        right=500,
+        bottom=400,
+        screen_name="MNG007DA6-4",
+        screen_serial="SERIAL-1",
+        screen_geometry=(0, 0, 1707, 1067),
+        device_pixel_ratio=1.5,
+        screen_primary=True,
+    )
+    path = tmp_path / "roi.json"
+
+    assert load_roi_config(save_roi_config(config, path)) == config
+
+
 def test_missing_or_invalid_roi_is_unconfigured(tmp_path):
     path = tmp_path / "roi.json"
     assert load_roi_config(path) is None

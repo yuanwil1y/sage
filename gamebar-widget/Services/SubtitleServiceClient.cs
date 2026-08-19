@@ -17,6 +17,7 @@ namespace ValorantTranslator.Services
         private CancellationTokenSource _cts;
         private Task _loop;
         private ulong _cursor;
+        private string _session;
         private string _lastStatus;
 
         public SubtitleServiceClient(SubtitleStore store, Action<string> onStatus)
@@ -75,6 +76,20 @@ namespace ValorantTranslator.Services
         private void DispatchBatch(string json)
         {
             JsonObject batch = JsonObject.Parse(json);
+            string session = batch.ContainsKey("session")
+                ? batch.GetNamedString("session", "")
+                : "";
+            if (!string.IsNullOrEmpty(session)
+                && !string.IsNullOrEmpty(_session)
+                && !string.Equals(session, _session, StringComparison.Ordinal))
+            {
+                // Event ids restart at 1 after the local service restarts.
+                // Clear the visual store and resume from the new epoch.
+                _cursor = 0;
+                _store.Clear();
+            }
+            if (!string.IsNullOrEmpty(session)) _session = session;
+
             ulong batchCursor = ToUInt64(batch.GetNamedNumber("cursor", 0));
             JsonArray events = batch.GetNamedArray("events", new JsonArray());
             foreach (IJsonValue value in events)

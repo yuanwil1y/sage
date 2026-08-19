@@ -4,6 +4,7 @@
 - 日语参数正确传递
 - 短音频返回空
 - 多 segment 拼接
+- 运行时模型可显式卸载并在下一次需要时重载
 """
 
 import numpy as np
@@ -64,3 +65,10 @@ def test_short_audio_returns_empty() -> None:
     tc = Transcriber(model=model)
     assert tc.transcribe(_fake_audio(0.1)) == ""
     assert tc.transcribe(np.zeros(100, dtype=np.float32)) == ""
+
+
+def test_reset_model_drops_loaded_instance() -> None:
+    tc = Transcriber(model=FakeModel())
+    assert tc._model is not None
+    tc.reset_model()
+    assert tc._model is None
