@@ -163,3 +163,43 @@ def test_pcm_callback_exception_does_not_kill_stdout_reader():
     reader._read_loop(proc)
     proc.wait()
     assert calls >= 2
+
+
+class _IdleSupervisorReader(AudioCaptureReader):
+    """Test double that makes each supervisor wait only on its own stop event."""
+
+    def __init__(self, **kwargs):
+        super().__init__(exe_path=sys.executable, **kwargs)
+
+    def _supervise_loop(self, target_pid, stop_event):  # noqa: ARG002
+        stop_event.wait()
+
+
+def test_new_start_never_clears_old_generation_stop_event():
+    reader = _IdleSupervisorReader(supervisor_join_timeout=0.01)
+    old_stop = threading.Event()
+    old_gate = threading.Event()
+    old_observed: list[bool] = []
+
+    def blocked_old_generation() -> None:
+        old_gate.wait()
+        old_observed.append(old_stop.is_set())
+
+    old_thread = threading.Thread(target=blocked_old_generation, daemon=True)
+    reader._stop_event = old_stop
+    reader._reader_thread = old_thread
+    old_thread.start()
+
+    # start() must cancel the old generation, tolerate its join timeout, and
+    # create a brand-new event for PID B instead of clearing old_stop.
+    reader.start(2222)
+    try:
+        assert old_stop.is_set()
+        assert reader._stop_event is not old_stop
+        assert old_thread.is_alive()
+
+        old_gate.set()
+        old_thread.join(timeout=1.0)
+        assert old_observed == [True]
+    finally:
+        reader.stop()
