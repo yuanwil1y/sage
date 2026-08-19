@@ -124,6 +124,7 @@ class ChatOcrWorker:
         self.min_score = min_score
         self.capture: FrameCapture = capture or ScreenCapture(
             region.output_idx,
+            device_idx=region.device_idx,
             screen_geometry=region.screen_geometry,
             device_pixel_ratio=region.device_pixel_ratio,
             screen_primary=region.screen_primary,
