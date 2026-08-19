@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -47,7 +48,7 @@ def _read_model_state(model_key: str) -> tuple[str, tuple[tuple[str, int, int], 
 
 
 class RuntimeModelController:
-    """Hot-activate model installs/replacements and degrade safely on deletion."""
+    """Hot-activate model installs/replacements and recover runtime failures."""
 
     def __init__(
         self,
@@ -58,6 +59,9 @@ class RuntimeModelController:
         mt2_ready_timeout: float = 60.0,
         watch_interval: float = 1.0,
         state_reader: Callable[[str], object] | None = None,
+        retry_initial_delay: float = 2.0,
+        retry_max_delay: float = 60.0,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if translator_factory is None:
             from translation.hy_mt2_translator import HyMT2LocalTranslator
@@ -68,22 +72,41 @@ class RuntimeModelController:
         self.translator_factory = translator_factory
         self.mt2_ready_timeout = float(mt2_ready_timeout)
         self.watch_interval = max(0.1, float(watch_interval))
+        self.retry_initial_delay = max(0.1, float(retry_initial_delay))
+        self.retry_max_delay = max(self.retry_initial_delay, float(retry_max_delay))
+        self._clock = clock or time.monotonic
         self._state_reader = state_reader or _read_model_state
         self._last_states: dict[str, object] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._hy_runtime_active = False
+        self._hy_retry_attempt = 0
+        self._hy_next_retry_at: float | None = None
 
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
-        """Start a lightweight watcher without re-activating the initial state."""
+        """Start the watcher without forcing a healthy runtime to restart."""
         if self.running:
             return
         self._last_states = {
             key: self._safe_read_state(key) for key in _TRACKED_MODELS
         }
+        self._hy_runtime_active = self._detect_hy_runtime_active()
+        hy_state = self._last_states.get("hy-mt2")
+        if (
+            self._status_of(hy_state) == "installed"
+            and not self._hy_runtime_active
+        ):
+            # main.py may have already attempted startup and fallen back to
+            # passthrough. Schedule an immediate watcher retry without needing
+            # any model-file change.
+            self._hy_next_retry_at = self._clock()
+        else:
+            self._reset_hy_retry()
+
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._watch_loop,
@@ -112,13 +135,57 @@ class RuntimeModelController:
             return str(state[0])
         return str(state)
 
+    def _detect_hy_runtime_active(self) -> bool:
+        running = getattr(self.mt2_manager, "running", None)
+        translator = getattr(self.orchestrator, "translator", None)
+        if running is None:
+            return self._hy_runtime_active
+        return bool(running) and translator is not None and not isinstance(
+            translator, PassthroughTranslator
+        )
+
+    def _reset_hy_retry(self) -> None:
+        self._hy_retry_attempt = 0
+        self._hy_next_retry_at = None
+
+    def _schedule_hy_retry(self) -> None:
+        self._hy_retry_attempt += 1
+        delay = min(
+            self.retry_max_delay,
+            self.retry_initial_delay * (2 ** max(0, self._hy_retry_attempt - 1)),
+        )
+        self._hy_next_retry_at = self._clock() + delay
+        log.warning(
+            "Hy-MT2 runtime 将在 %.1fs 后进行第 %d 次重试",
+            delay,
+            self._hy_retry_attempt,
+        )
+
+    def _maybe_retry_hy_mt2(self) -> None:
+        if self._hy_runtime_active:
+            running = getattr(self.mt2_manager, "running", None)
+            if running is False:
+                self._hy_runtime_active = False
+                self._hy_next_retry_at = self._clock()
+                log.warning("检测到 Hy-MT2 runtime 已退出，准备恢复")
+            else:
+                return
+
+        if self._hy_next_retry_at is None:
+            self._hy_next_retry_at = self._clock()
+        if self._clock() < self._hy_next_retry_at:
+            return
+        self._refresh_hy_mt2("重试")
+
     def refresh_once(self) -> None:
-        """Poll tracked model fingerprints once and apply stable state changes."""
+        """Poll model fingerprints and reconcile desired/runtime state once."""
         for model_key in _TRACKED_MODELS:
             current = self._safe_read_state(model_key)
             previous = self._last_states.get(model_key, current)
             if current == previous:
                 self._last_states[model_key] = current
+                if model_key == "hy-mt2" and self._status_of(current) == "installed":
+                    self._maybe_retry_hy_mt2()
                 continue
 
             self._last_states[model_key] = current
@@ -157,18 +224,20 @@ class RuntimeModelController:
         if callable(report):
             report(section, text)
 
-    def _refresh_hy_mt2(self, action: str) -> None:
-        # A replacement model should never be loaded while the old server still
-        # has the GGUF file open. Delete likewise needs to stop the process.
+    def _refresh_hy_mt2(self, action: str) -> bool:
+        # A replacement/retry should never load while an old server still has
+        # the GGUF file open. Delete likewise needs to stop the process.
         self.mt2_manager.stop()
+        self._hy_runtime_active = False
 
         if action == "删除":
             self.orchestrator.replace_translator(PassthroughTranslator())
             self._report("Local Translation", "Hy-MT2: unavailable")
+            self._reset_hy_retry()
             log.info("Hy-MT2 已删除，运行时切换为原文透传")
-            return
-        if action not in {"下载", "导入"}:
-            return
+            return False
+        if action not in {"下载", "导入", "重试"}:
+            return False
 
         try:
             self.mt2_manager.start()
@@ -178,12 +247,16 @@ class RuntimeModelController:
             self.mt2_manager.stop()
             self.orchestrator.replace_translator(PassthroughTranslator())
             self._report("Local Translation", f"Hy-MT2: unavailable ({exc})")
+            self._schedule_hy_retry()
             log.exception("Hy-MT2 模型已安装，但运行时激活失败")
-            return
+            return False
 
         self.orchestrator.replace_translator(translator)
+        self._hy_runtime_active = True
+        self._reset_hy_retry()
         self._report("Local Translation", "Hy-MT2: loaded")
-        log.info("Hy-MT2 模型变更已热激活")
+        log.info("Hy-MT2 模型变更/恢复已热激活")
+        return True
 
     def _refresh_whisper(self, action: str) -> None:
         transcriber = getattr(self.orchestrator, "transcriber", None)
